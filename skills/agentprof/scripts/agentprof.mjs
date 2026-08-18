@@ -838,6 +838,9 @@ function startWebServer(discover, port) {
   });
 }
 
+// src/version.ts
+var VERSION = "0.1.0";
+
 // src/cli.ts
 var C = {
   reset: "\x1B[0m",
@@ -970,6 +973,10 @@ function main() {
   const positional = args.filter(
     (a, i) => !a.startsWith("--") && !VALUE_OPTS.has(args[i - 1])
   );
+  if (flags.has("--version") || flags.has("-v")) {
+    console.log(`agentprof ${VERSION}`);
+    return;
+  }
   if (flags.has("--help") || flags.has("-h")) {
     console.log(`agentprof \u2014 profiler for AI agent sessions
 

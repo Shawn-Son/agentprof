@@ -27,6 +27,7 @@ import { profileSession } from "./analyze.js";
 import { parseClaudeCodeLog } from "./parsers/claudeCode.js";
 import { renderReport } from "./report.js";
 import { startWebServer } from "./web.js";
+import { VERSION } from "./version.js";
 import type { SessionProfile } from "./types.js";
 
 const C = {
@@ -180,6 +181,11 @@ function main(): void {
   const positional = args.filter(
     (a, i) => !a.startsWith("--") && !VALUE_OPTS.has(args[i - 1]),
   );
+
+  if (flags.has("--version") || flags.has("-v")) {
+    console.log(`agentprof ${VERSION}`);
+    return;
+  }
 
   if (flags.has("--help") || flags.has("-h")) {
     console.log(`agentprof — profiler for AI agent sessions

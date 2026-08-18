@@ -4,15 +4,21 @@
 
 Coding agents like Claude Code burn tokens in ways no dashboard shows you: the same file read twice, a failed command retried five times, a context window that snowballs until every single request re-pays for 800K tokens of history. Cost trackers tell you *how much* you spent. `agentprof` tells you *where it leaked*.
 
+## Install
+
+From your project root (any project where you use Claude Code), run **one** of these — both produce the identical skill folder:
+
 ```bash
-npx -y agentprof init         # install the /agentprof skill into your project
+# with npm
+npx -y agentprof init
 ```
 
-The skill is **fully self-contained** — the entire profiler engine (one zero-dependency 45KB script) ships inside the skill folder, so there is nothing else to install and nothing runs over the network. No npm? Copy the two files straight from this repo:
-
 ```bash
+# without npm — copy the two files straight from this repo
 mkdir -p .claude/skills/agentprof/scripts && curl -fsSL https://raw.githubusercontent.com/Shawn-Son/agentprof/main/skills/agentprof/SKILL.md -o .claude/skills/agentprof/SKILL.md && curl -fsSL https://raw.githubusercontent.com/Shawn-Son/agentprof/main/skills/agentprof/scripts/agentprof.mjs -o .claude/skills/agentprof/scripts/agentprof.mjs
 ```
+
+The skill is **fully self-contained** — the entire profiler engine (one zero-dependency 45KB script) ships inside the skill folder, so there is nothing else to install and nothing runs over the network. Requirements: Node 18+ (which Claude Code already needs).
 
 Then, inside Claude Code:
 
@@ -23,6 +29,28 @@ Then, inside Claude Code:
 ```
 
 Claude profiles **this project's** sessions — never the whole machine — and answers with headline numbers first.
+
+**Share it with your team** by committing the folder — everyone who clones the project gets `/agentprof` automatically:
+
+```bash
+git add .claude/skills/agentprof && git commit -m "Add agentprof skill"
+```
+
+## Update
+
+The skill never updates itself (no auto-update, no network calls). To update, **re-run the same install command you used above** — it overwrites the skill folder in place with the latest version. Your project code is untouched.
+
+```bash
+npx -y agentprof@latest init      # npm path
+```
+
+…or re-run the curl command from Install. Check which version you have:
+
+```bash
+node .claude/skills/agentprof/scripts/agentprof.mjs --version
+```
+
+On a team, one person updates and commits the folder; everyone else gets it on `git pull`. To uninstall, delete `.claude/skills/agentprof/`.
 
 Prefer the terminal?
 
