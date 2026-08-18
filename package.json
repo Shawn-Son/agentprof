@@ -13,6 +13,11 @@
     "flamegraph"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shawn-Son/agentprof.git"
+  },
+  "homepage": "https://github.com/Shawn-Son/agentprof#readme",
   "type": "module",
   "bin": {
     "agentprof": "./dist/cli.js"
