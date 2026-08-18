@@ -12,12 +12,13 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { profileSession } from "./analyze.js";
 import { parseClaudeCodeLog } from "./parsers/claudeCode.js";
 import { renderReport } from "./report.js";
+import { SKILL_MD } from "./skillTemplate.js";
 import { startWebServer } from "./web.js";
 import type { SessionProfile } from "./types.js";
 
@@ -178,10 +179,12 @@ function main(): void {
 
 Usage:
   agentprof                    profile the latest session of the current project
+  agentprof --project          summarize every session of the current project
   agentprof <file.jsonl>       profile one session log (writes an HTML report)
   agentprof <dir>              summarize every session in a directory
   agentprof --all              summarize every session on this machine
-  agentprof web                live local dashboard of every session (monitor)
+  agentprof init               install the /agentprof skill into this project
+  agentprof web                live local dashboard (optional, machine-wide)
   agentprof web <dir>          monitor a specific directory only
   agentprof --list             list recent sessions
 
@@ -191,6 +194,18 @@ Options:
   --json         print the profile as JSON instead
   --port <n>     web monitor port (default 4040)
   --top <n>      rows to show in summary tables (default 20)`);
+    return;
+  }
+
+  if (positional[0] === "init") {
+    const dir = resolve(".claude", "skills", "agentprof");
+    mkdirSync(dir, { recursive: true });
+    const target = join(dir, "SKILL.md");
+    writeFileSync(target, SKILL_MD);
+    console.log(
+      `${C.green}✓${C.reset} installed skill → ${target}\n` +
+        `  In Claude Code, ask ${C.bold}"where did my money go?"${C.reset} or run ${C.bold}/agentprof${C.reset}.`,
+    );
     return;
   }
 
@@ -225,8 +240,21 @@ Options:
   }
 
   let targets: string[] = [];
+  let aggregate = false;
   if (flags.has("--all")) {
+    aggregate = true;
     targets = findJsonl(projectsRoot());
+  } else if (flags.has("--project")) {
+    aggregate = true;
+    const dir = join(projectsRoot(), encodeProjectDir(process.cwd()));
+    if (!existsSync(dir)) {
+      console.error(
+        `${C.yellow}No session logs found for this project.${C.reset}\nLooked in ${dir}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    targets = findJsonl(dir);
   } else if (positional.length > 0) {
     for (const arg of positional) {
       const p = resolve(arg);
@@ -235,8 +263,10 @@ Options:
         process.exitCode = 1;
         return;
       }
-      if (statSync(p).isDirectory()) targets.push(...findJsonl(p));
-      else targets.push(p);
+      if (statSync(p).isDirectory()) {
+        aggregate = true;
+        targets.push(...findJsonl(p));
+      } else targets.push(p);
     }
   } else {
     const latest = latestSessionForCwd();
@@ -258,7 +288,7 @@ Options:
     return;
   }
 
-  if (targets.length === 1) {
+  if (targets.length === 1 && !aggregate) {
     const profile = profileFile(targets[0]);
     if (flags.has("--json")) {
       console.log(
@@ -300,15 +330,26 @@ Options:
       }
     }
     if (flags.has("--json")) {
+      const totalCost = profiles.reduce((n, p) => n + p.totalCost.total, 0);
+      const wastedCost = profiles.reduce((n, p) => n + p.wastedCost, 0);
       console.log(
         JSON.stringify(
-          profiles.map((p) => ({
-            sessionId: p.trajectory.sessionId,
-            file: p.trajectory.filePath,
-            totalCost: p.totalCost.total,
-            wastedCost: p.wastedCost,
-            wasteRatio: p.wasteRatio,
-          })),
+          {
+            sessions: profiles.length,
+            totalCost,
+            wastedCost,
+            wasteRatio: totalCost > 0 ? wastedCost / totalCost : 0,
+            perSession: profiles.map((p) => ({
+              sessionId: p.trajectory.sessionId,
+              file: p.trajectory.filePath,
+              firstUserMessage: p.trajectory.firstUserMessage,
+              steps: p.stepCosts.length,
+              totalCost: p.totalCost.total,
+              wastedCost: p.wastedCost,
+              wasteRatio: p.wasteRatio,
+              topFindings: p.findings.slice(0, 3),
+            })),
+          },
           null,
           2,
         ),

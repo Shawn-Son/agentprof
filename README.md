@@ -5,12 +5,19 @@
 Coding agents like Claude Code burn tokens in ways no dashboard shows you: the same file read twice, a failed command retried five times, a context window that snowballs until every single request re-pays for 800K tokens of history. Cost trackers tell you *how much* you spent. `agentprof` tells you *where it leaked*.
 
 ```bash
-npx agentprof            # profile your latest Claude Code session
-npx agentprof --all      # every session on this machine
-npx agentprof web        # live dashboard of all sessions → http://localhost:4040
+npx -y agentprof init         # install the /agentprof skill into your project
 ```
 
-No account. No API key. No instrumentation. It reads the session logs already sitting on your disk (`~/.claude/projects/**/*.jsonl`) and produces a terminal summary plus a self-contained HTML report.
+Then, inside Claude Code, just ask: *"where did my money go?"* — or run `/agentprof`. Claude profiles **this project's** sessions and explains the leaks with dollar amounts and concrete fixes.
+
+Prefer the terminal?
+
+```bash
+npx agentprof --project  # every session of the current project
+npx agentprof            # just the latest session (+ HTML report)
+```
+
+No account. No API key. No instrumentation. It reads the session logs already sitting on your disk (`~/.claude/projects/**/*.jsonl`), scoped to your project, and produces a terminal summary plus a self-contained HTML report. Nothing leaves your machine.
 
 ## What you get
 
@@ -34,28 +41,26 @@ Text tokens are estimated at 4 chars/token; images at a flat ~1,600 visual token
 ## Usage
 
 ```bash
+agentprof init                     # install the /agentprof skill into this project
+agentprof --project                # every session of the current project
 agentprof                          # latest session of the current project
 agentprof path/to/session.jsonl    # one session → HTML report
 agentprof ~/.claude/projects/…/    # every session in a directory (summary table)
 agentprof --all                    # everything on this machine
 agentprof --json                   # machine-readable output
 agentprof --open                   # open the HTML report in your browser
-agentprof web [--port 4040]        # live local dashboard (auto-refreshes)
+agentprof web [--port 4040]        # optional: live local dashboard (auto-refreshes)
 ```
 
-## Live monitor
+## The skill (recommended)
 
-`agentprof web` serves a dashboard on `127.0.0.1` — every session on the machine, sorted by recency, with cost/waste columns, a green pulse on sessions active in the last 5 minutes, and click-through to full per-session reports. It auto-reloads when any session log changes, so you can keep it open on a second screen while your agents work. Nothing ever leaves your machine.
+`agentprof init` drops `.claude/skills/agentprof/SKILL.md` into your project. From then on anyone on the project can ask Claude *"how much has this project cost?"*, *"did the agent waste tokens?"*, or `/agentprof` — and Claude runs the profiler (project-scoped), reads the JSON, and answers with the headline numbers, the top leaks, and what to do about them. Commit the skill file so your whole team gets it.
 
-## Claude Code skill
+To install it user-wide instead (works in every project): `mkdir -p ~/.claude/skills && cp -r skills/agentprof ~/.claude/skills/`
 
-Prefer asking Claude instead of running a CLI? Install the bundled skill:
+## Live monitor (optional)
 
-```bash
-mkdir -p ~/.claude/skills && cp -r skills/agentprof ~/.claude/skills/
-```
-
-Then, inside any Claude Code session: `/agentprof` — or just ask *"where did my money go this session?"* Claude runs the profiler and explains the leaks with concrete suggestions.
+`agentprof web` serves a dashboard on `127.0.0.1` — sessions sorted by recency with cost/waste columns, a green pulse on sessions active in the last 5 minutes, and click-through to full per-session reports. It auto-reloads when any session log changes. Pass a directory to scope it (e.g. your project's log dir); default is machine-wide.
 
 ## Roadmap
 
