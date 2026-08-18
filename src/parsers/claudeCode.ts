@@ -91,20 +91,6 @@ function canonicalJson(value: unknown): string {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(",")}}`;
 }
 
-export function canParse(firstLines: string[]): boolean {
-  return firstLines.some((l) => {
-    try {
-      const o = JSON.parse(l);
-      return (
-        typeof o.sessionId === "string" &&
-        (o.type === "user" || o.type === "assistant" || o.type === "queue-operation")
-      );
-    } catch {
-      return false;
-    }
-  });
-}
-
 export function parseClaudeCodeLog(filePath: string): Trajectory {
   const text = readFileSync(filePath, "utf8");
   const lines = text.split("\n");
@@ -113,6 +99,8 @@ export function parseClaudeCodeLog(filePath: string): Trajectory {
   const stepsByKey = new Map<string, Step>();
   const stepOrder: Step[] = [];
   const callsById = new Map<string, ToolCall>();
+  // steps whose usage has been captured (usage may arrive on any line of a request)
+  const usageSeen = new Set<Step>();
 
   let sessionId = basename(filePath).replace(/\.jsonl$/, "");
   let cwd: string | undefined;
@@ -160,13 +148,14 @@ export function parseClaudeCodeLog(filePath: string): Trajectory {
           textChars: 0,
           isSidechain: o.isSidechain === true,
         };
-        // Usage is identical on every line of the same request — set once.
-        const u = m.usage;
-        if (u) {
-          step.usage = normalizeUsage(u);
-        }
         stepsByKey.set(key, step);
         stepOrder.push(step);
+      }
+      // Usage is identical on every line of the same request — capture it once,
+      // from whichever line of the request carries it first.
+      if (m.usage && !usageSeen.has(step)) {
+        step.usage = normalizeUsage(m.usage);
+        usageSeen.add(step);
       }
       const content = m.content;
       if (Array.isArray(content)) {
@@ -192,10 +181,13 @@ export function parseClaudeCodeLog(filePath: string): Trajectory {
     } else if (o.type === "user" && o.message) {
       const content = o.message.content;
       if (Array.isArray(content)) {
+        let hasToolResult = false;
+        let firstText: string | undefined;
         for (const block of content) {
           if (!block || typeof block !== "object") continue;
           const b = block as Record<string, unknown>;
           if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
+            hasToolResult = true;
             const call = callsById.get(b.tool_use_id);
             if (call) {
               const size = contentSize(b.content);
@@ -206,14 +198,16 @@ export function parseClaudeCodeLog(filePath: string): Trajectory {
                 timestamp: o.timestamp,
               };
             }
+          } else if (b.type === "text" && typeof b.text === "string" && !firstText) {
+            firstText = b.text;
           }
         }
-      } else if (typeof content === "string" && !firstUserMessage) {
-        const trimmed = content.trim();
-        // skip command/meta noise
-        if (trimmed && !trimmed.startsWith("<")) {
-          firstUserMessage = trimmed.slice(0, 300);
+        // A real user turn can arrive as content blocks (e.g. with attachments).
+        if (!hasToolResult && firstText && !firstUserMessage) {
+          firstUserMessage = cleanPrompt(firstText);
         }
+      } else if (typeof content === "string" && !firstUserMessage) {
+        firstUserMessage = cleanPrompt(content);
       }
     }
   }
@@ -229,6 +223,13 @@ export function parseClaudeCodeLog(filePath: string): Trajectory {
     endTime,
     steps: stepOrder,
   };
+}
+
+/** Trim, drop command/meta noise, cap length. Returns undefined for noise. */
+function cleanPrompt(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith("<")) return undefined;
+  return trimmed.slice(0, 300);
 }
 
 function normalizeUsage(u: NonNullable<RawLine["message"]>["usage"]): Usage {

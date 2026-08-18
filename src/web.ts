@@ -71,10 +71,6 @@ function collectRows(discover: () => string[]): SessionRow[] {
   return rows.sort((a, b) => b.mtimeMs - a.mtimeMs);
 }
 
-function stateStamp(rows: SessionRow[]): string {
-  return rows.map((r) => `${r.file}:${r.mtimeMs}`).join("|");
-}
-
 function renderIndex(rows: SessionRow[]): string {
   const total = rows.reduce((n, r) => n + r.profile.totalCost.total, 0);
   const waste = rows.reduce((n, r) => n + r.profile.wastedCost, 0);
@@ -230,8 +226,4 @@ export function startWebServer(discover: () => string[], port: number): void {
   server.listen(port, "127.0.0.1", () => {
     console.log(`agentprof monitor → http://localhost:${port}`);
   });
-}
-
-export function stateStampFor(discover: () => string[]): string {
-  return stateStamp(collectRows(discover));
 }

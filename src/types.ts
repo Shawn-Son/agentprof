@@ -105,7 +105,8 @@ export interface ToolStat {
   name: string;
   calls: number;
   errors: number;
-  resultChars: number;
+  /** Estimated result tokens (text chars/4 + ~1600 per image). */
+  resultTokens: number;
   /** Estimated context cost of this tool's results over the session. */
   estContextCost: number;
 }

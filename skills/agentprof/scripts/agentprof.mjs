@@ -109,14 +109,21 @@ function profileSession(trajectory) {
       steps.filter((s) => !priceFor(s.model) && s.model !== "<synthetic>").map((s) => s.model)
     )
   ];
-  const mainSteps = steps.filter((s) => !s.isSidechain).length;
-  const sideSteps = steps.length - mainSteps;
-  const laterSteps = (step) => {
-    const after = steps.filter(
-      (s) => s.isSidechain === step.isSidechain && s.index > step.index
-    ).length;
-    return after;
-  };
+  const totalMain = steps.filter((s) => !s.isSidechain).length;
+  const totalSide = steps.length - totalMain;
+  const laterCount = new Array(steps.length).fill(0);
+  let seenMain = 0;
+  let seenSide = 0;
+  for (const s of steps) {
+    if (s.isSidechain) {
+      seenSide += 1;
+      laterCount[s.index] = totalSide - seenSide;
+    } else {
+      seenMain += 1;
+      laterCount[s.index] = totalMain - seenMain;
+    }
+  }
+  const laterSteps = (step) => laterCount[step.index] ?? 0;
   const persistenceCost = (tokens, step) => {
     const p = priceFor(step.model);
     if (!p) return 0;
@@ -131,8 +138,6 @@ function profileSession(trajectory) {
   const wastedTokens = findings.reduce((n, f) => n + f.wastedTokens, 0);
   const toolStats = computeToolStats(steps, persistenceCost);
   const durationMs = trajectory.startTime && trajectory.endTime ? Date.parse(trajectory.endTime) - Date.parse(trajectory.startTime) : 0;
-  void mainSteps;
-  void sideSteps;
   return {
     trajectory,
     stepCosts,
@@ -164,6 +169,7 @@ function inputFilePath(call) {
 }
 function detectRereads(steps, persistenceCost) {
   const calls = allCalls(steps);
+  const chainKey = (step, p) => `${step.isSidechain ? "s" : "m"}:${p}`;
   const lastModified = /* @__PURE__ */ new Map();
   const lastRead = /* @__PURE__ */ new Map();
   const wasteByFile = /* @__PURE__ */ new Map();
@@ -171,16 +177,20 @@ function detectRereads(steps, persistenceCost) {
     const { call, step, ordinal } = site;
     if (FILE_MUTATING_TOOLS.has(call.name)) {
       const p2 = inputFilePath(call);
-      if (p2) lastModified.set(p2, ordinal);
+      if (p2) {
+        lastModified.set(`m:${p2}`, ordinal);
+        lastModified.set(`s:${p2}`, ordinal);
+      }
       continue;
     }
     if (call.name !== "Read") continue;
     const p = inputFilePath(call);
     if (!p) continue;
-    const prevRead = lastRead.get(p);
-    lastRead.set(p, ordinal);
+    const key = chainKey(step, p);
+    const prevRead = lastRead.get(key);
+    lastRead.set(key, ordinal);
     if (prevRead === void 0) continue;
-    const modifiedSince = (lastModified.get(p) ?? -1) > prevRead;
+    const modifiedSince = (lastModified.get(key) ?? -1) > prevRead;
     if (modifiedSince) continue;
     const tokens = resultTokens(call.result);
     if (tokens === 0) continue;
@@ -203,7 +213,7 @@ function detectDuplicateCalls(steps, persistenceCost) {
   const wasteByKey = /* @__PURE__ */ new Map();
   for (const { call, step } of calls) {
     if (!READONLY_TOOLS.has(call.name)) continue;
-    const key = `${call.name}\0${call.inputKey}`;
+    const key = `${step.isSidechain ? "s" : "m"}:${call.name} ${call.inputKey}`;
     if (!seen.has(key)) {
       seen.add(key);
       continue;
@@ -256,11 +266,12 @@ function computeToolStats(steps, persistenceCost) {
   const stats = /* @__PURE__ */ new Map();
   for (const step of steps) {
     for (const call of step.toolCalls) {
-      const s = stats.get(call.name) ?? { name: call.name, calls: 0, errors: 0, resultChars: 0, estContextCost: 0 };
+      const s = stats.get(call.name) ?? { name: call.name, calls: 0, errors: 0, resultTokens: 0, estContextCost: 0 };
       s.calls += 1;
       if (call.result?.isError) s.errors += 1;
-      s.resultChars += call.result?.contentChars ?? 0;
-      s.estContextCost += persistenceCost(resultTokens(call.result), step);
+      const tokens = resultTokens(call.result);
+      s.resultTokens += tokens;
+      s.estContextCost += persistenceCost(tokens, step);
       stats.set(call.name, s);
     }
   }
@@ -325,6 +336,7 @@ function parseClaudeCodeLog(filePath) {
   const stepsByKey = /* @__PURE__ */ new Map();
   const stepOrder = [];
   const callsById = /* @__PURE__ */ new Map();
+  const usageSeen = /* @__PURE__ */ new Set();
   let sessionId = basename(filePath).replace(/\.jsonl$/, "");
   let cwd;
   let version;
@@ -368,12 +380,12 @@ function parseClaudeCodeLog(filePath) {
           textChars: 0,
           isSidechain: o.isSidechain === true
         };
-        const u = m.usage;
-        if (u) {
-          step.usage = normalizeUsage(u);
-        }
         stepsByKey.set(key, step);
         stepOrder.push(step);
+      }
+      if (m.usage && !usageSeen.has(step)) {
+        step.usage = normalizeUsage(m.usage);
+        usageSeen.add(step);
       }
       const content = m.content;
       if (Array.isArray(content)) {
@@ -399,10 +411,13 @@ function parseClaudeCodeLog(filePath) {
     } else if (o.type === "user" && o.message) {
       const content = o.message.content;
       if (Array.isArray(content)) {
+        let hasToolResult = false;
+        let firstText;
         for (const block of content) {
           if (!block || typeof block !== "object") continue;
           const b = block;
           if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
+            hasToolResult = true;
             const call = callsById.get(b.tool_use_id);
             if (call) {
               const size = contentSize(b.content);
@@ -413,13 +428,15 @@ function parseClaudeCodeLog(filePath) {
                 timestamp: o.timestamp
               };
             }
+          } else if (b.type === "text" && typeof b.text === "string" && !firstText) {
+            firstText = b.text;
           }
         }
-      } else if (typeof content === "string" && !firstUserMessage) {
-        const trimmed = content.trim();
-        if (trimmed && !trimmed.startsWith("<")) {
-          firstUserMessage = trimmed.slice(0, 300);
+        if (!hasToolResult && firstText && !firstUserMessage) {
+          firstUserMessage = cleanPrompt(firstText);
         }
+      } else if (typeof content === "string" && !firstUserMessage) {
+        firstUserMessage = cleanPrompt(content);
       }
     }
   }
@@ -434,6 +451,11 @@ function parseClaudeCodeLog(filePath) {
     endTime,
     steps: stepOrder
   };
+}
+function cleanPrompt(text) {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith("<")) return void 0;
+  return trimmed.slice(0, 300);
 }
 function normalizeUsage(u) {
   const cc = u?.cache_creation;
@@ -539,7 +561,7 @@ ${sc.step.toolCalls.map((x) => x.name).join(", ") || "no tools"}`;
       <td class="mono">${esc(s.name)}</td>
       <td class="num">${s.calls}</td>
       <td class="num">${s.errors > 0 ? `<span class="err">${s.errors}</span>` : "0"}</td>
-      <td class="num">${compact(estTok(s.resultChars))}</td>
+      <td class="num">${compact(s.resultTokens)}</td>
       <td class="num cost">${usd(s.estContextCost)}</td>
     </tr>`
   ).join("");
@@ -653,9 +675,6 @@ ${unknownNote}
 <footer>Generated by <a href="https://github.com/Shawn-Son/agentprof">agentprof</a> \u2014 measure, optimize, prove.</footer>
 </body>
 </html>`;
-}
-function estTok(chars) {
-  return Math.round(chars / 4);
 }
 
 // src/web.ts
@@ -861,6 +880,7 @@ function encodeProjectDir(cwd) {
 }
 function findJsonl(dir) {
   const out = [];
+  const mtimes = /* @__PURE__ */ new Map();
   const walk = (d) => {
     let entries;
     try {
@@ -877,11 +897,23 @@ function findJsonl(dir) {
         continue;
       }
       if (st.isDirectory()) walk(p);
-      else if (e.endsWith(".jsonl")) out.push(p);
+      else if (e.endsWith(".jsonl")) {
+        out.push(p);
+        mtimes.set(p, st.mtimeMs);
+      }
     }
   };
   walk(dir);
-  return out.sort((a, b) => statSync2(b).mtimeMs - statSync2(a).mtimeMs);
+  return out.sort((a, b) => (mtimes.get(b) ?? 0) - (mtimes.get(a) ?? 0));
+}
+function openInBrowser(target) {
+  if (process.platform === "darwin") execFile("open", [target], () => {
+  });
+  else if (process.platform === "win32")
+    execFile("cmd", ["/c", "start", "", target], () => {
+    });
+  else execFile("xdg-open", [target], () => {
+  });
 }
 function latestSessionForCwd() {
   const dir = join(projectsRoot(), encodeProjectDir(process.cwd()));
@@ -964,14 +996,14 @@ function printTable(profiles, top) {
 }
 function main() {
   const args = process.argv.slice(2);
-  const flags = new Set(args.filter((a) => a.startsWith("--")));
+  const flags = new Set(args.filter((a) => a.startsWith("-")));
   const getOpt = (name) => {
     const i = args.indexOf(name);
     return i >= 0 && args[i + 1] && !args[i + 1].startsWith("--") ? args[i + 1] : void 0;
   };
   const VALUE_OPTS = /* @__PURE__ */ new Set(["--out", "--top", "--port"]);
   const positional = args.filter(
-    (a, i) => !a.startsWith("--") && !VALUE_OPTS.has(args[i - 1])
+    (a, i) => !a.startsWith("-") && !VALUE_OPTS.has(args[i - 1])
   );
   if (flags.has("--version") || flags.has("-v")) {
     console.log(`agentprof ${VERSION}`);
@@ -1027,11 +1059,7 @@ Options:
     }
     const port = Number(getOpt("--port") ?? 4040);
     startWebServer(() => findJsonl(scope), port);
-    if (flags.has("--open")) {
-      const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-      execFile(opener, [`http://localhost:${port}`], () => {
-      });
-    }
+    if (flags.has("--open")) openInBrowser(`http://localhost:${port}`);
     return;
   }
   if (flags.has("--list")) {
@@ -1115,11 +1143,7 @@ Try: agentprof --all   or   agentprof <path-to-session.jsonl>`
     console.log(`
   ${C.green}\u2937 report:${C.reset} ${out}
 `);
-    if (flags.has("--open")) {
-      const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-      execFile(opener, [out], () => {
-      });
-    }
+    if (flags.has("--open")) openInBrowser(out);
   } else {
     const profiles = [];
     for (const f of targets) {

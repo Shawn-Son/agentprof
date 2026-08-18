@@ -60,6 +60,7 @@ function encodeProjectDir(cwd: string): string {
 
 function findJsonl(dir: string): string[] {
   const out: string[] = [];
+  const mtimes = new Map<string, number>();
   const walk = (d: string) => {
     let entries: string[];
     try {
@@ -76,11 +77,21 @@ function findJsonl(dir: string): string[] {
         continue;
       }
       if (st.isDirectory()) walk(p);
-      else if (e.endsWith(".jsonl")) out.push(p);
+      else if (e.endsWith(".jsonl")) {
+        out.push(p);
+        mtimes.set(p, st.mtimeMs);
+      }
     }
   };
   walk(dir);
-  return out.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  return out.sort((a, b) => (mtimes.get(b) ?? 0) - (mtimes.get(a) ?? 0));
+}
+
+function openInBrowser(target: string): void {
+  if (process.platform === "darwin") execFile("open", [target], () => {});
+  else if (process.platform === "win32")
+    execFile("cmd", ["/c", "start", "", target], () => {});
+  else execFile("xdg-open", [target], () => {});
 }
 
 function latestSessionForCwd(): string | undefined {
@@ -170,7 +181,7 @@ function printTable(profiles: SessionProfile[], top: number): void {
 
 function main(): void {
   const args = process.argv.slice(2);
-  const flags = new Set(args.filter((a) => a.startsWith("--")));
+  const flags = new Set(args.filter((a) => a.startsWith("-")));
   const getOpt = (name: string): string | undefined => {
     const i = args.indexOf(name);
     return i >= 0 && args[i + 1] && !args[i + 1].startsWith("--")
@@ -179,7 +190,7 @@ function main(): void {
   };
   const VALUE_OPTS = new Set(["--out", "--top", "--port"]);
   const positional = args.filter(
-    (a, i) => !a.startsWith("--") && !VALUE_OPTS.has(args[i - 1]),
+    (a, i) => !a.startsWith("-") && !VALUE_OPTS.has(args[i - 1]),
   );
 
   if (flags.has("--version") || flags.has("-v")) {
@@ -242,15 +253,7 @@ Options:
     }
     const port = Number(getOpt("--port") ?? 4040);
     startWebServer(() => findJsonl(scope), port);
-    if (flags.has("--open")) {
-      const opener =
-        process.platform === "darwin"
-          ? "open"
-          : process.platform === "win32"
-            ? "start"
-            : "xdg-open";
-      execFile(opener, [`http://localhost:${port}`], () => {});
-    }
+    if (flags.has("--open")) openInBrowser(`http://localhost:${port}`);
     return;
   }
 
@@ -335,15 +338,7 @@ Options:
     const out = resolve(getOpt("--out") ?? "agentprof-report.html");
     writeFileSync(out, renderReport(profile));
     console.log(`\n  ${C.green}⤷ report:${C.reset} ${out}\n`);
-    if (flags.has("--open")) {
-      const opener =
-        process.platform === "darwin"
-          ? "open"
-          : process.platform === "win32"
-            ? "start"
-            : "xdg-open";
-      execFile(opener, [out], () => {});
-    }
+    if (flags.has("--open")) openInBrowser(out);
   } else {
     const profiles: SessionProfile[] = [];
     for (const f of targets) {

@@ -115,15 +115,23 @@ export function profileSession(trajectory: Trajectory): SessionProfile {
     ),
   ];
 
-  // How many later requests re-read context added at a given step (per chain).
-  const mainSteps = steps.filter((s) => !s.isSidechain).length;
-  const sideSteps = steps.length - mainSteps;
-  const laterSteps = (step: Step): number => {
-    const after = steps.filter(
-      (s) => s.isSidechain === step.isSidechain && s.index > step.index,
-    ).length;
-    return after;
-  };
+  // How many later requests re-read context added at a given step. Precomputed
+  // per chain (main vs sidechain) so persistenceCost is O(1) per call.
+  const totalMain = steps.filter((s) => !s.isSidechain).length;
+  const totalSide = steps.length - totalMain;
+  const laterCount = new Array<number>(steps.length).fill(0);
+  let seenMain = 0;
+  let seenSide = 0;
+  for (const s of steps) {
+    if (s.isSidechain) {
+      seenSide += 1;
+      laterCount[s.index] = totalSide - seenSide;
+    } else {
+      seenMain += 1;
+      laterCount[s.index] = totalMain - seenMain;
+    }
+  }
+  const laterSteps = (step: Step): number => laterCount[step.index] ?? 0;
 
   const persistenceCost = (tokens: number, step: Step): number => {
     const p = priceFor(step.model);
@@ -150,9 +158,6 @@ export function profileSession(trajectory: Trajectory): SessionProfile {
     trajectory.startTime && trajectory.endTime
       ? Date.parse(trajectory.endTime) - Date.parse(trajectory.startTime)
       : 0;
-
-  void mainSteps;
-  void sideSteps;
 
   return {
     trajectory,
@@ -203,9 +208,13 @@ function detectRereads(
   persistenceCost: (tokens: number, step: Step) => number,
 ): WasteFinding[] {
   const calls = allCalls(steps);
-  // file path -> ordinal of last modification
+  // Keys are chain-scoped ("m:" main / "s:" sidechain): a read repeated in a
+  // DIFFERENT chain runs in a separate context and is not redundant there.
+  const chainKey = (step: Step, p: string): string =>
+    `${step.isSidechain ? "s" : "m"}:${p}`;
+  // chain:path -> ordinal of last modification
   const lastModified = new Map<string, number>();
-  // file path -> ordinal of last read (same chain)
+  // chain:path -> ordinal of last read
   const lastRead = new Map<string, number>();
   const wasteByFile = new Map<
     string,
@@ -216,16 +225,22 @@ function detectRereads(
     const { call, step, ordinal } = site;
     if (FILE_MUTATING_TOOLS.has(call.name)) {
       const p = inputFilePath(call);
-      if (p) lastModified.set(p, ordinal);
+      // A modification invalidates earlier reads in every chain (the file on
+      // disk changed for both), so record it under both chain keys.
+      if (p) {
+        lastModified.set(`m:${p}`, ordinal);
+        lastModified.set(`s:${p}`, ordinal);
+      }
       continue;
     }
     if (call.name !== "Read") continue;
     const p = inputFilePath(call);
     if (!p) continue;
-    const prevRead = lastRead.get(p);
-    lastRead.set(p, ordinal);
+    const key = chainKey(step, p);
+    const prevRead = lastRead.get(key);
+    lastRead.set(key, ordinal);
     if (prevRead === undefined) continue;
-    const modifiedSince = (lastModified.get(p) ?? -1) > prevRead;
+    const modifiedSince = (lastModified.get(key) ?? -1) > prevRead;
     if (modifiedSince) continue; // legitimate re-read after an edit
     const tokens = resultTokens(call.result);
     if (tokens === 0) continue;
@@ -270,7 +285,9 @@ function detectDuplicateCalls(
 
   for (const { call, step } of calls) {
     if (!READONLY_TOOLS.has(call.name)) continue;
-    const key = `${call.name} ${call.inputKey}`;
+    // Chain-scoped: an identical call in a different chain (main vs sidechain)
+    // runs in a separate context and is not a redundant repeat there.
+    const key = `${step.isSidechain ? "s" : "m"}:${call.name} ${call.inputKey}`;
     if (!seen.has(key)) {
       seen.add(key);
       continue;
@@ -350,11 +367,12 @@ function computeToolStats(
     for (const call of step.toolCalls) {
       const s =
         stats.get(call.name) ??
-        { name: call.name, calls: 0, errors: 0, resultChars: 0, estContextCost: 0 };
+        { name: call.name, calls: 0, errors: 0, resultTokens: 0, estContextCost: 0 };
       s.calls += 1;
       if (call.result?.isError) s.errors += 1;
-      s.resultChars += call.result?.contentChars ?? 0;
-      s.estContextCost += persistenceCost(resultTokens(call.result), step);
+      const tokens = resultTokens(call.result);
+      s.resultTokens += tokens;
+      s.estContextCost += persistenceCost(tokens, step);
       stats.set(call.name, s);
     }
   }
