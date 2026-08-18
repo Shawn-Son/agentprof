@@ -12,13 +12,20 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { profileSession } from "./analyze.js";
 import { parseClaudeCodeLog } from "./parsers/claudeCode.js";
 import { renderReport } from "./report.js";
-import { SKILL_MD } from "./skillTemplate.js";
 import { startWebServer } from "./web.js";
 import type { SessionProfile } from "./types.js";
 
@@ -198,13 +205,24 @@ Options:
   }
 
   if (positional[0] === "init") {
+    // Locate the packaged skill folder (SKILL.md + bundled engine). Works from
+    // the npm package (dist/cli.js → ../skills/agentprof) and from a copy of
+    // the bundled engine already living inside a skill folder (scripts/ → ..).
+    const here = dirname(fileURLToPath(import.meta.url));
+    const candidates = [join(here, "..", "skills", "agentprof"), join(here, "..")];
+    const source = candidates.find((d) => existsSync(join(d, "SKILL.md")));
+    if (!source) {
+      console.error(`${C.red}could not locate the skill source folder${C.reset}`);
+      process.exitCode = 1;
+      return;
+    }
     const dir = resolve(".claude", "skills", "agentprof");
     mkdirSync(dir, { recursive: true });
-    const target = join(dir, "SKILL.md");
-    writeFileSync(target, SKILL_MD);
+    cpSync(source, dir, { recursive: true });
     console.log(
-      `${C.green}✓${C.reset} installed skill → ${target}\n` +
-        `  In Claude Code, run ${C.bold}/agentprof usage${C.reset} or ${C.bold}/agentprof waste${C.reset}.`,
+      `${C.green}✓${C.reset} installed skill (with bundled engine) → ${dir}\n` +
+        `  In Claude Code, run ${C.bold}/agentprof usage${C.reset} or ${C.bold}/agentprof waste${C.reset}.\n` +
+        `  Commit the folder to share it with your team.`,
     );
     return;
   }

@@ -8,6 +8,12 @@ Coding agents like Claude Code burn tokens in ways no dashboard shows you: the s
 npx -y agentprof init         # install the /agentprof skill into your project
 ```
 
+The skill is **fully self-contained** — the entire profiler engine (one zero-dependency 45KB script) ships inside the skill folder, so there is nothing else to install and nothing runs over the network. No npm? Copy the two files straight from this repo:
+
+```bash
+mkdir -p .claude/skills/agentprof/scripts && curl -fsSL https://raw.githubusercontent.com/Shawn-Son/agentprof/main/skills/agentprof/SKILL.md -o .claude/skills/agentprof/SKILL.md && curl -fsSL https://raw.githubusercontent.com/Shawn-Son/agentprof/main/skills/agentprof/scripts/agentprof.mjs -o .claude/skills/agentprof/scripts/agentprof.mjs
+```
+
 Then, inside Claude Code:
 
 ```
@@ -62,7 +68,15 @@ agentprof web [--port 4040]        # optional: live local dashboard (auto-refres
 
 ## The skill (recommended)
 
-`agentprof init` drops `.claude/skills/agentprof/SKILL.md` into your project. From then on anyone on the project can run `/agentprof usage` or `/agentprof waste` (or just ask *"how much has this project cost?"*) — Claude runs the profiler (project-scoped), reads the JSON, and answers with the headline numbers, the top leaks, and what to do about them. Commit the skill file so your whole team gets it.
+`agentprof init` drops the whole skill — instructions **and** the bundled engine — into `.claude/skills/agentprof/`:
+
+```
+.claude/skills/agentprof/
+├── SKILL.md               # when to trigger + how Claude interprets results
+└── scripts/agentprof.mjs  # the entire profiler, one zero-dependency script
+```
+
+From then on anyone on the project can run `/agentprof usage` or `/agentprof waste` (or just ask *"how much has this project cost?"*) — Claude runs the bundled engine (project-scoped, `node`-only, offline), reads the JSON, and answers with the headline numbers, the top leaks, and what to do about them. Commit the folder so your whole team gets it.
 
 To install it user-wide instead (works in every project): `mkdir -p ~/.claude/skills && cp -r skills/agentprof ~/.claude/skills/`
 

@@ -10,6 +10,10 @@ money went and how much was wasted. Scope is always the current project (the
 logs under ~/.claude/projects that belong to this working directory) — never
 the whole machine. Everything runs locally.
 
+The full profiler engine ships inside this skill at
+`scripts/agentprof.mjs` (zero dependencies, plain Node). Run it with `node`;
+no install or network is required.
+
 ## Subcommands
 
 The skill is invoked with a subcommand: `/agentprof <subcommand>`.
@@ -18,7 +22,7 @@ The skill is invoked with a subcommand: `/agentprof <subcommand>`.
 |---|---|
 | `/agentprof usage` | Report project spend: total cost, cost breakdown (input / output / cache read / cache write), tokens, per-session costs. |
 | `/agentprof waste` | Report estimated waste: waste $ and % of total, top leaks (rereads, duplicate calls, retry tax) with dollar amounts, and concrete advice. |
-| `/agentprof report` | Generate the HTML report for the latest session and open it: `npx -y agentprof --open`. |
+| `/agentprof report` | Generate the HTML report for the latest session and open it: `node .claude/skills/agentprof/scripts/agentprof.mjs --open` |
 | `/agentprof` (bare) or anything else | Briefly list the subcommands above, then give a one-line combined summary (total cost + waste %). |
 
 Natural-language questions map to the same flows: "how much has this project
@@ -27,14 +31,16 @@ cost?" → usage; "did the agent waste tokens?" → waste.
 ## Commands
 
 ```bash
-npx -y agentprof --project --json    # every session of THIS project (default data source)
-npx -y agentprof --json              # latest session only
-npx -y agentprof <file.jsonl> --open # one session → HTML report in the browser
+node .claude/skills/agentprof/scripts/agentprof.mjs --project --json    # every session of THIS project (default data source)
+node .claude/skills/agentprof/scripts/agentprof.mjs --json              # latest session only
+node .claude/skills/agentprof/scripts/agentprof.mjs --open              # latest session → HTML report in the browser
 ```
+
+Run from the project root (where `.claude/` lives).
 
 ## Workflow
 
-1. Run `npx -y agentprof --project --json` (use the latest-session form only
+1. Run the `--project --json` command above (use the latest-session form only
    when the user explicitly asks about the current/latest session).
 2. Read the JSON. Key fields:
    - `totalCost`, `sessions`, `perSession[]` — cost per session with `firstUserMessage`, `steps`.

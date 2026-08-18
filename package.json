@@ -23,18 +23,21 @@
     "agentprof": "./dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "skills"
   ],
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run bundle",
+    "bundle": "esbuild src/cli.ts --bundle --platform=node --format=esm --outfile=skills/agentprof/scripts/agentprof.mjs",
     "dev": "tsc --watch",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.6.0"
   }
 }
