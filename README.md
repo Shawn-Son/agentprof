@@ -8,7 +8,15 @@ Coding agents like Claude Code burn tokens in ways no dashboard shows you: the s
 npx -y agentprof init         # install the /agentprof skill into your project
 ```
 
-Then, inside Claude Code, just ask: *"where did my money go?"* — or run `/agentprof`. Claude profiles **this project's** sessions and explains the leaks with dollar amounts and concrete fixes.
+Then, inside Claude Code:
+
+```
+/agentprof usage     # how much has this project cost, per session
+/agentprof waste     # where money leaked, with dollar amounts and fixes
+/agentprof report    # full HTML report for the latest session
+```
+
+Claude profiles **this project's** sessions — never the whole machine — and answers with headline numbers first.
 
 Prefer the terminal?
 
@@ -54,7 +62,7 @@ agentprof web [--port 4040]        # optional: live local dashboard (auto-refres
 
 ## The skill (recommended)
 
-`agentprof init` drops `.claude/skills/agentprof/SKILL.md` into your project. From then on anyone on the project can ask Claude *"how much has this project cost?"*, *"did the agent waste tokens?"*, or `/agentprof` — and Claude runs the profiler (project-scoped), reads the JSON, and answers with the headline numbers, the top leaks, and what to do about them. Commit the skill file so your whole team gets it.
+`agentprof init` drops `.claude/skills/agentprof/SKILL.md` into your project. From then on anyone on the project can run `/agentprof usage` or `/agentprof waste` (or just ask *"how much has this project cost?"*) — Claude runs the profiler (project-scoped), reads the JSON, and answers with the headline numbers, the top leaks, and what to do about them. Commit the skill file so your whole team gets it.
 
 To install it user-wide instead (works in every project): `mkdir -p ~/.claude/skills && cp -r skills/agentprof ~/.claude/skills/`
 

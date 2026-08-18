@@ -5,7 +5,7 @@
 
 export const SKILL_MD = `---
 name: agentprof
-description: Check this project's Claude Code usage cost and waste. Use when the user asks where their tokens or money went, how expensive this project or session has been, whether the agent wasted tokens (re-reads, retries, duplicate calls), says "usage", "cost", "waste", or invokes /agentprof.
+description: Check this project's Claude Code usage cost and waste. Use when the user invokes /agentprof with a subcommand (usage, waste, report), or asks where their tokens or money went, how expensive this project or session has been, or whether the agent wasted tokens (re-reads, retries, duplicate calls).
 ---
 
 # agentprof — project usage & waste profiler
@@ -15,27 +15,39 @@ money went and how much was wasted. Scope is always the current project (the
 logs under ~/.claude/projects that belong to this working directory) — never
 the whole machine. Everything runs locally.
 
+## Subcommands
+
+The skill is invoked with a subcommand: \`/agentprof <subcommand>\`.
+
+| Subcommand | What to do |
+|---|---|
+| \`/agentprof usage\` | Report project spend: total cost, cost breakdown (input / output / cache read / cache write), tokens, per-session costs. |
+| \`/agentprof waste\` | Report estimated waste: waste $ and % of total, top leaks (rereads, duplicate calls, retry tax) with dollar amounts, and concrete advice. |
+| \`/agentprof report\` | Generate the HTML report for the latest session and open it: \`npx -y agentprof --open\`. |
+| \`/agentprof\` (bare) or anything else | Briefly list the subcommands above, then give a one-line combined summary (total cost + waste %). |
+
+Natural-language questions map to the same flows: "how much has this project
+cost?" → usage; "did the agent waste tokens?" → waste.
+
 ## Commands
 
 \`\`\`bash
-npx -y agentprof --project --json    # every session of THIS project (default scope for questions about "this project")
+npx -y agentprof --project --json    # every session of THIS project (default data source)
 npx -y agentprof --json              # latest session only
-npx -y agentprof <file.jsonl>        # one specific session → terminal summary + HTML report
+npx -y agentprof <file.jsonl> --open # one session → HTML report in the browser
 \`\`\`
 
 ## Workflow
 
-1. Pick the scope from the user's question: whole project (\`--project\`) or
-   just the latest/current session (no flag). Default to \`--project\` when
-   they ask about "this project" or overall usage.
-2. Run with \`--json\` and read the output. Key fields:
-   - \`totalCost\` — dollars at list price, cache-aware (input / output / cacheRead / cacheWrite).
+1. Run \`npx -y agentprof --project --json\` (use the latest-session form only
+   when the user explicitly asks about the current/latest session).
+2. Read the JSON. Key fields:
+   - \`totalCost\`, \`sessions\`, \`perSession[]\` — cost per session with \`firstUserMessage\`, \`steps\`.
    - \`wastedCost\`, \`wasteRatio\` — estimated waste and its share of total.
-   - \`findings[]\` / \`topFindings[]\` — each leak: \`kind\` (\`reread\` | \`duplicate-call\` | \`retry\`), \`label\` (file/tool), \`occurrences\`, \`wastedTokens\`, \`wastedCost\`.
-   - \`toolStats[]\` — per-tool calls, errors, and estimated context cost.
-3. Answer with the headline first: total project cost, waste $ and %, then the
-   top 3 concrete leaks with dollar amounts. Keep it short. Offer the HTML
-   report for a single session (\`agentprof <file> --open\`) if they want detail.
+   - \`perSession[].topFindings[]\` — each leak: \`kind\` (\`reread\` | \`duplicate-call\` | \`retry\`), \`label\` (file/tool), \`occurrences\`, \`wastedTokens\`, \`wastedCost\`.
+3. Answer with the headline first, then details. Keep it short.
+   - **usage**: total project cost, then the 3-5 most expensive sessions (cost, steps, first prompt).
+   - **waste**: waste $ and %, then the top 3 leaks with dollar amounts and one-line fixes.
 
 ## Interpreting results honestly
 

@@ -204,7 +204,7 @@ Options:
     writeFileSync(target, SKILL_MD);
     console.log(
       `${C.green}✓${C.reset} installed skill → ${target}\n` +
-        `  In Claude Code, ask ${C.bold}"where did my money go?"${C.reset} or run ${C.bold}/agentprof${C.reset}.`,
+        `  In Claude Code, run ${C.bold}/agentprof usage${C.reset} or ${C.bold}/agentprof waste${C.reset}.`,
     );
     return;
   }
