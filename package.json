@@ -1,0 +1,35 @@
+{
+  "name": "agentprof",
+  "version": "0.1.0",
+  "description": "Profiler for AI agent sessions — see where your money went, and how much of it was waste.",
+  "keywords": [
+    "claude-code",
+    "llm",
+    "agent",
+    "profiler",
+    "tokens",
+    "cost",
+    "waste",
+    "flamegraph"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "agentprof": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^20.0.0"
+  }
+}
