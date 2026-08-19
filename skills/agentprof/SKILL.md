@@ -14,6 +14,14 @@ The full profiler engine ships inside this skill at
 `scripts/agentprof.mjs` (zero dependencies, plain Node). Run it with `node`;
 no install or network is required.
 
+**ENGINE path:** this skill folder may be installed at project level or user
+level. Use whichever of these exists (check project first):
+
+- `.claude/skills/agentprof/scripts/agentprof.mjs` (project install)
+- `~/.claude/skills/agentprof/scripts/agentprof.mjs` (user-level install)
+
+Every command below writes `<ENGINE>` for that path.
+
 ## Subcommands
 
 The skill is invoked with a subcommand: `/agentprof <subcommand>`.
@@ -22,7 +30,7 @@ The skill is invoked with a subcommand: `/agentprof <subcommand>`.
 |---|---|
 | `/agentprof usage` | Report project spend: total cost, cost breakdown (input / output / cache read / cache write), tokens, per-session costs. |
 | `/agentprof waste` | Report estimated waste: waste $ and % of total, top leaks (rereads, duplicate calls, retry tax) with dollar amounts, and concrete advice. |
-| `/agentprof report` | Generate the HTML report for the latest session and open it: `node .claude/skills/agentprof/scripts/agentprof.mjs --open` |
+| `/agentprof report` | Generate the HTML report for the latest session and open it: `node <ENGINE> --open` |
 | `/agentprof` (bare) or anything else | Briefly list the subcommands above, then give a one-line combined summary (total cost + waste %). |
 
 Natural-language questions map to the same flows: "how much has this project
@@ -31,12 +39,13 @@ cost?" → usage; "did the agent waste tokens?" → waste.
 ## Commands
 
 ```bash
-node .claude/skills/agentprof/scripts/agentprof.mjs --project --json    # every session of THIS project (default data source)
-node .claude/skills/agentprof/scripts/agentprof.mjs --json              # latest session only
-node .claude/skills/agentprof/scripts/agentprof.mjs --open              # latest session → HTML report in the browser
+node <ENGINE> --project --json    # every session of THIS project (default data source)
+node <ENGINE> --json              # latest session only
+node <ENGINE> --open              # latest session → HTML report in the browser
 ```
 
-Run from the project root (where `.claude/` lives).
+Run from the project root (the profiler scopes to the current working
+directory's project, regardless of where the skill folder lives).
 
 ## Workflow
 
