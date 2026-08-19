@@ -5,8 +5,6 @@
  *   agentprof                 profile the latest session of the current project
  *   agentprof <file.jsonl>    profile one session log
  *   agentprof <dir>           summarize every session in a directory
- *   agentprof --all           summarize every session on this machine
- *   agentprof --list          list recent sessions
  *
  * Options: --out <file>  --open  --json  --top <n>
  */
@@ -26,7 +24,6 @@ import { fileURLToPath } from "node:url";
 import { profileSession } from "./analyze.js";
 import { parseClaudeCodeLog } from "./parsers/claudeCode.js";
 import { renderReport } from "./report.js";
-import { startWebServer } from "./web.js";
 import { VERSION } from "./version.js";
 import type { SessionProfile } from "./types.js";
 
@@ -188,7 +185,7 @@ function main(): void {
       ? args[i + 1]
       : undefined;
   };
-  const VALUE_OPTS = new Set(["--out", "--top", "--port"]);
+  const VALUE_OPTS = new Set(["--out", "--top"]);
   const positional = args.filter(
     (a, i) => !a.startsWith("-") && !VALUE_OPTS.has(args[i - 1]),
   );
@@ -202,21 +199,16 @@ function main(): void {
     console.log(`agentprof — profiler for AI agent sessions
 
 Usage:
+  agentprof init               install the /agentprof skill into this project
   agentprof                    profile the latest session of the current project
   agentprof --project          summarize every session of the current project
   agentprof <file.jsonl>       profile one session log (writes an HTML report)
   agentprof <dir>              summarize every session in a directory
-  agentprof --all              summarize every session on this machine
-  agentprof init               install the /agentprof skill into this project
-  agentprof web                live local dashboard (optional, machine-wide)
-  agentprof web <dir>          monitor a specific directory only
-  agentprof --list             list recent sessions
 
 Options:
   --out <file>   where to write the HTML report (default: ./agentprof-report.html)
-  --open         open the report/dashboard in your browser
+  --open         open the report in your browser
   --json         print the profile as JSON instead
-  --port <n>     web monitor port (default 4040)
   --top <n>      rows to show in summary tables (default 20)`);
     return;
   }
@@ -244,34 +236,9 @@ Options:
     return;
   }
 
-  if (positional[0] === "web") {
-    const scope = positional[1] ? resolve(positional[1]) : projectsRoot();
-    if (!existsSync(scope)) {
-      console.error(`${C.red}not found:${C.reset} ${scope}`);
-      process.exitCode = 1;
-      return;
-    }
-    const port = Number(getOpt("--port") ?? 4040);
-    startWebServer(() => findJsonl(scope), port);
-    if (flags.has("--open")) openInBrowser(`http://localhost:${port}`);
-    return;
-  }
-
-  if (flags.has("--list")) {
-    const files = findJsonl(projectsRoot()).slice(0, Number(getOpt("--top") ?? 20));
-    for (const f of files) {
-      const st = statSync(f);
-      console.log(`${st.mtime.toISOString().slice(0, 16)}  ${f}`);
-    }
-    return;
-  }
-
   let targets: string[] = [];
   let aggregate = false;
-  if (flags.has("--all")) {
-    aggregate = true;
-    targets = findJsonl(projectsRoot());
-  } else if (flags.has("--project")) {
+  if (flags.has("--project")) {
     aggregate = true;
     const dir = join(projectsRoot(), encodeProjectDir(process.cwd()));
     if (!existsSync(dir)) {
@@ -301,7 +268,7 @@ Options:
       console.error(
         `${C.yellow}No session logs found for this project.${C.reset}\n` +
           `Looked in ${join(projectsRoot(), encodeProjectDir(process.cwd()))}\n` +
-          `Try: agentprof --all   or   agentprof <path-to-session.jsonl>`,
+          `Try: agentprof <path-to-session.jsonl>`,
       );
       process.exitCode = 1;
       return;

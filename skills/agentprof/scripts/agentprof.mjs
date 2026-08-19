@@ -7,7 +7,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
-  statSync as statSync2,
+  statSync,
   writeFileSync
 } from "node:fs";
 import { homedir } from "node:os";
@@ -677,186 +677,6 @@ ${unknownNote}
 </html>`;
 }
 
-// src/web.ts
-import { createServer } from "node:http";
-import { statSync } from "node:fs";
-var esc2 = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-var usd2 = (n) => n >= 100 ? `$${n.toFixed(0)}` : n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(3)}`;
-var compact2 = (n) => {
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
-  return String(n);
-};
-var cache = /* @__PURE__ */ new Map();
-function profileCached(file) {
-  let mtimeMs;
-  try {
-    mtimeMs = statSync(file).mtimeMs;
-  } catch {
-    cache.delete(file);
-    return void 0;
-  }
-  const hit = cache.get(file);
-  if (hit && hit.mtimeMs === mtimeMs) return hit.profile;
-  try {
-    const profile = profileSession(parseClaudeCodeLog(file));
-    cache.set(file, { mtimeMs, profile });
-    return profile;
-  } catch {
-    return void 0;
-  }
-}
-function collectRows(discover) {
-  const rows = [];
-  for (const file of discover()) {
-    const profile = profileCached(file);
-    if (!profile || profile.totalCost.total === 0) continue;
-    rows.push({ file, mtimeMs: statSync(file).mtimeMs, profile });
-  }
-  return rows.sort((a, b) => b.mtimeMs - a.mtimeMs);
-}
-function renderIndex(rows) {
-  const total = rows.reduce((n, r) => n + r.profile.totalCost.total, 0);
-  const waste = rows.reduce((n, r) => n + r.profile.wastedCost, 0);
-  const tokensIn = rows.reduce(
-    (n, r) => n + r.profile.totalUsage.inputTokens + r.profile.totalUsage.cacheReadTokens + r.profile.totalUsage.cacheWrite5mTokens + r.profile.totalUsage.cacheWrite1hTokens,
-    0
-  );
-  const now = Date.now();
-  const tr = rows.map((r) => {
-    const p = r.profile;
-    const t = p.trajectory;
-    const live = now - r.mtimeMs < 5 * 60 * 1e3;
-    const age = now - r.mtimeMs;
-    const ageStr = age < 36e5 ? Math.max(1, Math.round(age / 6e4)) + "m ago" : age < 864e5 ? Math.round(age / 36e5) + "h ago" : Math.round(age / 864e5) + "d ago";
-    const wastePct = p.totalCost.total > 0 ? (p.wasteRatio * 100).toFixed(0) + "%" : "\u2014";
-    return `<tr onclick="location='/session?f=${encodeURIComponent(r.file)}'">
-        <td>${live ? '<span class="live"></span>' : ""}<span class="mono">${esc2(t.sessionId.slice(0, 8))}</span></td>
-        <td class="proj mono">${esc2((t.cwd ?? "").split("/").slice(-2).join("/"))}</td>
-        <td class="prompt-cell">${esc2((t.firstUserMessage ?? "").slice(0, 72))}</td>
-        <td class="num">${p.stepCosts.length}</td>
-        <td class="num">${compact2(p.totalUsage.outputTokens)}</td>
-        <td class="num cost">${usd2(p.totalCost.total)}</td>
-        <td class="num waste">${usd2(p.wastedCost)} <span class="dim">${wastePct}</span></td>
-        <td class="num dim">${ageStr}</td>
-      </tr>`;
-  }).join("");
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>agentprof monitor</title>
-<style>
-  :root { --bg:#0b0e14; --panel:#12161f; --border:#1f2633; --text:#e6e9ef; --dim:#8b94a7; --waste:#ef4444; --live:#22c55e; }
-  * { box-sizing:border-box; margin:0; }
-  body { background:var(--bg); color:var(--text); font:14px/1.55 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; padding:32px 24px 64px; max-width:1160px; margin:0 auto; }
-  .mono { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:12.5px; }
-  h1 { font-size:20px; letter-spacing:-0.02em; } h1 b { color:#60a5fa; }
-  .sub { color:var(--dim); margin-top:4px; font-size:13px; }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin:20px 0; }
-  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
-  .card .k { color:var(--dim); font-size:12px; text-transform:uppercase; letter-spacing:0.06em; }
-  .card .v { font-size:24px; font-weight:650; margin-top:4px; }
-  .card.w .v { color:var(--waste); }
-  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
-  th { text-align:left; color:var(--dim); font-size:11.5px; text-transform:uppercase; letter-spacing:0.05em; padding:10px 10px; border-bottom:1px solid var(--border); }
-  td { padding:9px 10px; border-bottom:1px solid var(--border); }
-  tr:last-child td { border-bottom:none; }
-  tbody tr { cursor:pointer; } tbody tr:hover { background:#ffffff08; }
-  .num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
-  .cost { font-weight:600; } .waste { color:var(--waste); }
-  .dim { color:var(--dim); font-size:12px; }
-  .proj { color:var(--dim); white-space:nowrap; }
-  .prompt-cell { color:#c9d1de; max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .live { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--live); margin-right:7px; animation:pulse 1.6s infinite; vertical-align:1px; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
-  footer { color:var(--dim); font-size:12px; margin-top:20px; }
-</style>
-</head>
-<body>
-<h1><b>agentprof</b> \xB7 live monitor</h1>
-<div class="sub">${rows.length} sessions \xB7 auto-refreshes when logs change \xB7 <span class="live"></span>= active in the last 5 min</div>
-<div class="cards">
-  <div class="card"><div class="k">Total spend</div><div class="v">${usd2(total)}</div></div>
-  <div class="card w"><div class="k">Estimated waste</div><div class="v">${usd2(waste)}</div></div>
-  <div class="card"><div class="k">Tokens in</div><div class="v">${compact2(tokensIn)}</div></div>
-  <div class="card"><div class="k">Sessions</div><div class="v">${rows.length}</div></div>
-</div>
-<table>
-  <thead><tr><th>Session</th><th>Project</th><th>First prompt</th><th>Steps</th><th>Out tok</th><th>Cost</th><th>Waste</th><th>Last active</th></tr></thead>
-  <tbody>${tr}</tbody>
-</table>
-<footer>agentprof \u2014 measure, optimize, prove. Data never leaves this machine.</footer>
-<script>
-  let stamp = null;
-  async function poll() {
-    try {
-      const r = await fetch("/api/stamp");
-      const s = await r.text();
-      if (stamp === null) stamp = s;
-      else if (s !== stamp) location.reload();
-    } catch {}
-    setTimeout(poll, 5000);
-  }
-  poll();
-</script>
-</body>
-</html>`;
-}
-function startWebServer(discover, port) {
-  const server = createServer((req, res) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    try {
-      if (url.pathname === "/") {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        res.end(renderIndex(collectRows(discover)));
-      } else if (url.pathname === "/api/stamp") {
-        const rows = discover().map((f) => {
-          try {
-            return `${f}:${statSync(f).mtimeMs}`;
-          } catch {
-            return f;
-          }
-        });
-        res.writeHead(200, { "content-type": "text/plain" });
-        res.end(rows.join("|"));
-      } else if (url.pathname === "/session") {
-        const file = url.searchParams.get("f") ?? "";
-        const allowed = new Set(discover());
-        if (!allowed.has(file)) {
-          res.writeHead(404, { "content-type": "text/plain" });
-          res.end("unknown session");
-          return;
-        }
-        const profile = profileCached(file);
-        if (!profile) {
-          res.writeHead(404, { "content-type": "text/plain" });
-          res.end("could not parse session");
-          return;
-        }
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        res.end(
-          renderReport(profile).replace(
-            "<header>",
-            `<header><div style="margin-bottom:10px"><a href="/" style="color:#60a5fa;text-decoration:none;font-size:13px">\u2190 all sessions</a></div>`
-          )
-        );
-      } else {
-        res.writeHead(404, { "content-type": "text/plain" });
-        res.end("not found");
-      }
-    } catch (err) {
-      res.writeHead(500, { "content-type": "text/plain" });
-      res.end(String(err));
-    }
-  });
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`agentprof monitor \u2192 http://localhost:${port}`);
-  });
-}
-
 // src/version.ts
 var VERSION = "0.1.0";
 
@@ -871,7 +691,7 @@ var C = {
   blue: "\x1B[34m",
   cyan: "\x1B[36m"
 };
-var usd3 = (n) => n >= 100 ? `$${n.toFixed(0)}` : n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(3)}`;
+var usd2 = (n) => n >= 100 ? `$${n.toFixed(0)}` : n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(3)}`;
 function projectsRoot() {
   return join(homedir(), ".claude", "projects");
 }
@@ -892,7 +712,7 @@ function findJsonl(dir) {
       const p = join(d, e);
       let st;
       try {
-        st = statSync2(p);
+        st = statSync(p);
       } catch {
         continue;
       }
@@ -935,10 +755,10 @@ function printSummary(p) {
   }
   console.log("");
   console.log(
-    `  Total cost      ${C.bold}${usd3(p.totalCost.total)}${C.reset}  ${C.dim}(${p.stepCosts.length} requests, cache-aware list price)${C.reset}`
+    `  Total cost      ${C.bold}${usd2(p.totalCost.total)}${C.reset}  ${C.dim}(${p.stepCosts.length} requests, cache-aware list price)${C.reset}`
   );
   console.log(
-    `  Estimated waste ${C.red}${C.bold}${usd3(p.wastedCost)}${C.reset}  ${C.red}${wastePct}% of total${C.reset}`
+    `  Estimated waste ${C.red}${C.bold}${usd2(p.wastedCost)}${C.reset}  ${C.red}${wastePct}% of total${C.reset}`
   );
   const byKind = {};
   for (const f of p.findings) byKind[f.kind] = (byKind[f.kind] ?? 0) + f.wastedCost;
@@ -949,7 +769,7 @@ function printSummary(p) {
   ];
   for (const [k, label, color] of kinds) {
     if (byKind[k]) {
-      console.log(`    ${color}\u25B8${C.reset} ${label.padEnd(16)} ${usd3(byKind[k])}`);
+      console.log(`    ${color}\u25B8${C.reset} ${label.padEnd(16)} ${usd2(byKind[k])}`);
     }
   }
   console.log("");
@@ -959,7 +779,7 @@ function printSummary(p) {
     for (const f of top) {
       const tag = f.kind === "reread" ? "reread" : f.kind === "retry" ? "retry" : "dup";
       console.log(
-        `    ${C.dim}${tag.padEnd(7)}${C.reset}${f.label.slice(0, 70).padEnd(72)} ${f.occurrences}\xD7 ${C.bold}${usd3(f.wastedCost)}${C.reset}`
+        `    ${C.dim}${tag.padEnd(7)}${C.reset}${f.label.slice(0, 70).padEnd(72)} ${f.occurrences}\xD7 ${C.bold}${usd2(f.wastedCost)}${C.reset}`
       );
     }
   }
@@ -976,7 +796,7 @@ function printTable(profiles, top) {
   const waste = profiles.reduce((n, p) => n + p.wastedCost, 0);
   console.log("");
   console.log(
-    `${C.bold}agentprof${C.reset} \u2014 ${profiles.length} sessions \xB7 total ${C.bold}${usd3(total)}${C.reset} \xB7 estimated waste ${C.red}${C.bold}${usd3(waste)} (${total ? (waste / total * 100).toFixed(1) : 0}%)${C.reset}`
+    `${C.bold}agentprof${C.reset} \u2014 ${profiles.length} sessions \xB7 total ${C.bold}${usd2(total)}${C.reset} \xB7 estimated waste ${C.red}${C.bold}${usd2(waste)} (${total ? (waste / total * 100).toFixed(1) : 0}%)${C.reset}`
   );
   console.log("");
   console.log(
@@ -986,7 +806,7 @@ function printTable(profiles, top) {
     const t = p.trajectory;
     const pctS = (p.wasteRatio * 100).toFixed(0) + "%";
     console.log(
-      `  ${t.sessionId.slice(0, 8).padEnd(10)}${usd3(p.totalCost.total).padStart(9)}${C.red}${usd3(p.wastedCost).padStart(9)}${pctS.padStart(7)}${C.reset}  ${String(p.stepCosts.length).padStart(5)}  ${C.dim}${(p.trajectory.firstUserMessage ?? "").slice(0, 48)}${C.reset}`
+      `  ${t.sessionId.slice(0, 8).padEnd(10)}${usd2(p.totalCost.total).padStart(9)}${C.red}${usd2(p.wastedCost).padStart(9)}${pctS.padStart(7)}${C.reset}  ${String(p.stepCosts.length).padStart(5)}  ${C.dim}${(p.trajectory.firstUserMessage ?? "").slice(0, 48)}${C.reset}`
     );
   }
   console.log(
@@ -1001,7 +821,7 @@ function main() {
     const i = args.indexOf(name);
     return i >= 0 && args[i + 1] && !args[i + 1].startsWith("--") ? args[i + 1] : void 0;
   };
-  const VALUE_OPTS = /* @__PURE__ */ new Set(["--out", "--top", "--port"]);
+  const VALUE_OPTS = /* @__PURE__ */ new Set(["--out", "--top"]);
   const positional = args.filter(
     (a, i) => !a.startsWith("-") && !VALUE_OPTS.has(args[i - 1])
   );
@@ -1013,21 +833,16 @@ function main() {
     console.log(`agentprof \u2014 profiler for AI agent sessions
 
 Usage:
+  agentprof init               install the /agentprof skill into this project
   agentprof                    profile the latest session of the current project
   agentprof --project          summarize every session of the current project
   agentprof <file.jsonl>       profile one session log (writes an HTML report)
   agentprof <dir>              summarize every session in a directory
-  agentprof --all              summarize every session on this machine
-  agentprof init               install the /agentprof skill into this project
-  agentprof web                live local dashboard (optional, machine-wide)
-  agentprof web <dir>          monitor a specific directory only
-  agentprof --list             list recent sessions
 
 Options:
   --out <file>   where to write the HTML report (default: ./agentprof-report.html)
-  --open         open the report/dashboard in your browser
+  --open         open the report in your browser
   --json         print the profile as JSON instead
-  --port <n>     web monitor port (default 4040)
   --top <n>      rows to show in summary tables (default 20)`);
     return;
   }
@@ -1050,32 +865,9 @@ Options:
     );
     return;
   }
-  if (positional[0] === "web") {
-    const scope = positional[1] ? resolve(positional[1]) : projectsRoot();
-    if (!existsSync(scope)) {
-      console.error(`${C.red}not found:${C.reset} ${scope}`);
-      process.exitCode = 1;
-      return;
-    }
-    const port = Number(getOpt("--port") ?? 4040);
-    startWebServer(() => findJsonl(scope), port);
-    if (flags.has("--open")) openInBrowser(`http://localhost:${port}`);
-    return;
-  }
-  if (flags.has("--list")) {
-    const files = findJsonl(projectsRoot()).slice(0, Number(getOpt("--top") ?? 20));
-    for (const f of files) {
-      const st = statSync2(f);
-      console.log(`${st.mtime.toISOString().slice(0, 16)}  ${f}`);
-    }
-    return;
-  }
   let targets = [];
   let aggregate = false;
-  if (flags.has("--all")) {
-    aggregate = true;
-    targets = findJsonl(projectsRoot());
-  } else if (flags.has("--project")) {
+  if (flags.has("--project")) {
     aggregate = true;
     const dir = join(projectsRoot(), encodeProjectDir(process.cwd()));
     if (!existsSync(dir)) {
@@ -1095,7 +887,7 @@ Looked in ${dir}`
         process.exitCode = 1;
         return;
       }
-      if (statSync2(p).isDirectory()) {
+      if (statSync(p).isDirectory()) {
         aggregate = true;
         targets.push(...findJsonl(p));
       } else targets.push(p);
@@ -1106,7 +898,7 @@ Looked in ${dir}`
       console.error(
         `${C.yellow}No session logs found for this project.${C.reset}
 Looked in ${join(projectsRoot(), encodeProjectDir(process.cwd()))}
-Try: agentprof --all   or   agentprof <path-to-session.jsonl>`
+Try: agentprof <path-to-session.jsonl>`
       );
       process.exitCode = 1;
       return;

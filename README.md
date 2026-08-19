@@ -87,11 +87,8 @@ agentprof init                     # install the /agentprof skill into this proj
 agentprof --project                # every session of the current project
 agentprof                          # latest session of the current project
 agentprof path/to/session.jsonl    # one session → HTML report
-agentprof ~/.claude/projects/…/    # every session in a directory (summary table)
-agentprof --all                    # everything on this machine
 agentprof --json                   # machine-readable output
 agentprof --open                   # open the HTML report in your browser
-agentprof web [--port 4040]        # optional: live local dashboard (auto-refreshes)
 ```
 
 ## The skill (recommended)
@@ -107,10 +104,6 @@ agentprof web [--port 4040]        # optional: live local dashboard (auto-refres
 From then on anyone on the project can run `/agentprof usage` or `/agentprof waste` (or just ask *"how much has this project cost?"*) — Claude runs the bundled engine (project-scoped, `node`-only, offline), reads the JSON, and answers with the headline numbers, the top leaks, and what to do about them. Commit the folder so your whole team gets it.
 
 To install it user-wide instead (works in every project): `mkdir -p ~/.claude/skills && cp -r skills/agentprof ~/.claude/skills/`
-
-## Live monitor (optional)
-
-`agentprof web` serves a dashboard on `127.0.0.1` — sessions sorted by recency with cost/waste columns, a green pulse on sessions active in the last 5 minutes, and click-through to full per-session reports. It auto-reloads when any session log changes. Pass a directory to scope it (e.g. your project's log dir); default is machine-wide.
 
 ## Roadmap
 
