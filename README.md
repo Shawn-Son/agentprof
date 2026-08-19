@@ -115,12 +115,15 @@ To install it user-wide instead (works in every project): `mkdir -p ~/.claude/sk
 
 Trajectory parsing is adapter-based (Claude Code today; Codex/Gemini CLI/OpenTelemetry GenAI traces welcome — the analyzers only see a neutral IR).
 
-## Development
+## What's in this repo
 
-```bash
-npm install
-npm run build
-node dist/cli.js --all
+The repo **is** the skill — nothing else:
+
+```
+skills/agentprof/
+├── SKILL.md               # the prompt: triggers, subcommands, interpretation rules
+└── scripts/agentprof.mjs  # the engine: one readable zero-dependency file (source = executable)
+package.json               # only so `npx agentprof init` works; no dependencies, no build step
 ```
 
-Zero runtime dependencies. MIT license.
+There is no build system: `agentprof.mjs` is plain Node — what you read is what runs. To contribute, edit that one file and test with `node skills/agentprof/scripts/agentprof.mjs --project`. MIT license.

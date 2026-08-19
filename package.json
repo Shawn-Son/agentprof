@@ -1,16 +1,16 @@
 {
   "name": "agentprof",
   "version": "0.1.0",
-  "description": "Profiler for AI agent sessions — see where your money went, and how much of it was waste.",
+  "description": "Claude Code skill that profiles your project's token usage and waste — see where your money went.",
   "keywords": [
     "claude-code",
+    "claude-code-skill",
     "llm",
     "agent",
     "profiler",
     "tokens",
     "cost",
-    "waste",
-    "flamegraph"
+    "waste"
   ],
   "license": "MIT",
   "repository": {
@@ -20,24 +20,12 @@
   "homepage": "https://github.com/Shawn-Son/agentprof#readme",
   "type": "module",
   "bin": {
-    "agentprof": "./dist/cli.js"
+    "agentprof": "./skills/agentprof/scripts/agentprof.mjs"
   },
   "files": [
-    "dist",
     "skills"
   ],
   "engines": {
     "node": ">=18"
-  },
-  "scripts": {
-    "build": "tsc && npm run bundle",
-    "bundle": "esbuild src/cli.ts --bundle --platform=node --format=esm --outfile=skills/agentprof/scripts/agentprof.mjs",
-    "dev": "tsc --watch",
-    "prepublishOnly": "npm run build"
-  },
-  "devDependencies": {
-    "@types/node": "^20.0.0",
-    "esbuild": "^0.28.2",
-    "typescript": "^5.6.0"
   }
 }
