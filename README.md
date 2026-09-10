@@ -6,7 +6,7 @@ Cost trackers tell you *how much* you spent. `agentprof` tells you *where it lea
 
 ```
 ◆ Opus 5 │ ctx 41% │ 5h 34% · 7d 12% │ ≈ today $2.14 · 7d $18.3 · 30d $71.0
-🗑 waste $0.81 (38%: confirmed 24% + est 14%) ≈ 5h 11% │ stale 22% · tool-out 9% · MCP 7% │ /clear recommended
+◇ waste $0.81 (38%: confirmed 24% + est 14%) ≈ 5h 11% │ stale 22% · tool-out 9% · MCP 7% │ /clear recommended
 ```
 
 Subscription users see their 5h/7d limit percentages as the main indicator and the API-equivalent dollars as a reference. API-key users see dollars.

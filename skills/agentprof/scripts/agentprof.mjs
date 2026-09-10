@@ -106,6 +106,7 @@ const LOCK_TTL_MS = 120_000;
 const PREV_STATUSLINE_FILE = join(DATA_DIR, "prev-statusline.json");
 const SETTINGS_BACKUP_FILE = join(DATA_DIR, "settings.backup.json");
 const INSTALLED_ENGINE = join(DATA_DIR, "agentprof.mjs");
+const MODE_FILE = join(DATA_DIR, "mode.json"); // { subscription: true } once rate_limits was seen
 const SETTINGS_FILE = join(CLAUDE_DIR, "settings.json");
 const PROJECTS_ROOT = join(CLAUDE_DIR, "projects");
 
@@ -1050,7 +1051,12 @@ async function statusLine() {
   const rl = input.rate_limits;
   const five = typeof rl?.five_hour?.used_percentage === "number" ? rl.five_hour.used_percentage : null;
   const seven = typeof rl?.seven_day?.used_percentage === "number" ? rl.seven_day.used_percentage : null;
-  const subscription = five !== null || seven !== null;
+  // rate_limits only exists for Pro/Max and only after the first API response;
+  // remember it so a fresh session renders the subscription layout from the start.
+  let subscription = five !== null || seven !== null;
+  if (subscription) {
+    if (!readJson(MODE_FILE, null)?.subscription) writeJsonAtomic(MODE_FILE, { subscription: true });
+  } else subscription = readJson(MODE_FILE, null)?.subscription === true;
 
   if (!validSummary(summary)) {
     console.log([`${S.bold}◆ ${model}${S.reset}`, ctx, `${S.dim}agentprof: indexing…${S.reset}`].filter(Boolean).join(sep));
@@ -1070,7 +1076,7 @@ async function statusLine() {
     "cost",
     3,
   ).map((x) => `${WASTE[x.k].short} ${pct(t.cost > 0 ? x.cost / t.cost : 0)}`);
-  let head = `🗑 waste ${tone}${usd(t.wasteCost)}${S.reset} (${pct(ratio)}: confirmed ${pct(t.wasteRatioConfirmed)} + est ${pct(ratio - t.wasteRatioConfirmed)})`;
+  let head = `◇ waste ${tone}${usd(t.wasteCost)}${S.reset} (${pct(ratio)}: confirmed ${pct(t.wasteRatioConfirmed)} + est ${pct(ratio - t.wasteRatioConfirmed)})`;
   if (subscription && five !== null) head += ` ≈ 5h ${pct((ratio * five) / 100)}`;
   // Hints are about THIS session (that is where /clear or an MCP change acts).
   const hints = [];
