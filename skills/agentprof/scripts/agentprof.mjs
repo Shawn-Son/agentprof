@@ -1107,13 +1107,13 @@ function report(summary, top) {
   out.push("");
   out.push(
     table(
-      ["window", "cost", "requests", "confirmed", "estimated", "waste %", "cache expiry", "sessions"],
+      ["window", "cost", "requests", "waste", "= confirmed", "+ estimated", "waste %", "cache expiry", "sessions"],
       [
         ["today", W.today],
         ["7d", W.d7],
         ["30d", W.d30],
-      ].map(([n, w]) => [n, usd(w.cost), w.requests, usd(w.confirmedCost), usd(w.estimatedCost), `${pct(w.wasteRatioTotal, 1)} (${pct(w.wasteRatioConfirmed, 1)} confirmed)`, usd(w.expiryCost), w.sessions]),
-      ["l", "r", "r", "r", "r", "r", "r", "r"],
+      ].map(([n, w]) => [n, usd(w.cost), w.requests, usd(w.wasteCost), usd(w.confirmedCost), usd(w.estimatedCost), `${pct(w.wasteRatioTotal, 1)} (${pct(w.wasteRatioConfirmed, 1)} confirmed)`, usd(w.expiryCost), w.sessions]),
+      ["l", "r", "r", "r", "r", "r", "r", "r", "r"],
     ),
   );
   out.push("");
