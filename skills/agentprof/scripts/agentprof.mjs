@@ -1,39 +1,54 @@
 #!/usr/bin/env node
 /**
- * agentprof — profiler for Claude Code sessions.
+ * agentprof — token-waste tracker for Claude Code.
  * Single-file engine: this IS the source code (plain Node, zero dependencies).
  *
- *   node agentprof.mjs                profile the latest session of the current project
- *   node agentprof.mjs --project      summarize every session of the current project
- *   node agentprof.mjs <file.jsonl>   profile one session log (writes an HTML report)
- *   node agentprof.mjs init           install this skill into the current project
+ *   node agentprof.mjs on         show usage + waste in the Claude Code status line
+ *   node agentprof.mjs off        remove it again (restores your previous status line)
+ *   node agentprof.mjs report     usage, waste (W1–W7), per-project breakdown: today / 7d / 30d
+ *   node agentprof.mjs refresh    re-index transcripts now (the status line does this in the background)
+ *   node agentprof.mjs init       install this skill into the current project
  *
- * Options: --json  --out <file>  --open  --top <n>  --version
+ * Options: --json  --top <n>  --version
+ *
+ * Nothing runs over the network. Everything is derived from the transcripts
+ * Claude Code already writes to ~/.claude/projects/**\/*.jsonl.
  *
  * https://github.com/Shawn-Son/agentprof — MIT license
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import {
+  closeSync,
+  copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  renameSync,
+  rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 // ---------------------------------------------------------------------------
-// Pricing (USD per million tokens, Anthropic list prices; synced 2026-08-18).
-// Cache multipliers per Anthropic docs: 5m write = 1.25x input,
-// 1h write = 2x input, cache read = 0.1x input.
+// Pricing. USD per million tokens, Anthropic list prices.
+// Source: https://docs.anthropic.com/en/docs/about-claude/pricing
+// Cache multipliers per Anthropic docs: 5m write = 1.25x input, 1h write = 2x
+// input, cache read = 0.1x input. Unknown models are surfaced, never priced $0
+// silently. Override/extend with ~/.claude/agentprof/pricing.json
+// ({ "model-id": { "input": n, "output": n } }).
 // ---------------------------------------------------------------------------
+
+const PRICING_REVISED = "2026-08-18";
 
 const PRICES = {
   "claude-fable-5": { input: 10, output: 50 },
@@ -49,19 +64,19 @@ const PRICES = {
   "claude-sonnet-4-6": { input: 3, output: 15 },
   "claude-sonnet-4-5": { input: 3, output: 15 },
   "claude-sonnet-4-0": { input: 3, output: 15 },
+  "claude-3-7-sonnet": { input: 3, output: 15 },
+  "claude-3-5-sonnet": { input: 3, output: 15 },
   "claude-haiku-4-5": { input: 1, output: 5 },
   "claude-3-5-haiku": { input: 0.8, output: 4 },
-  "claude-3-haiku": { input: 0.25, output: 1.25 },
 };
 
-const CACHE_READ_MULT = 0.1;
 const CACHE_WRITE_5M_MULT = 1.25;
 const CACHE_WRITE_1H_MULT = 2;
+const CACHE_READ_MULT = 0.1;
 
 /**
  * Resolve a model id (possibly date-suffixed, e.g. "claude-haiku-4-5-20251001")
- * to a price entry. Returns undefined for unknown/synthetic models so callers
- * can surface them instead of silently pricing at zero.
+ * to a price entry. Returns undefined for unknown/synthetic models.
  */
 function priceFor(model) {
   if (!model || model === "<synthetic>") return undefined;
@@ -76,23 +91,108 @@ function priceFor(model) {
 }
 
 // ---------------------------------------------------------------------------
-// Parser: Claude Code session logs (~/.claude/projects/<project>/<id>.jsonl)
-// → a neutral trajectory shape { sessionId, steps[], ... }.
-//
-// Format notes (empirically verified; the format is not a documented contract):
-// - Each line is a JSON event; `type` is "user" | "assistant" | others we skip.
-// - One API response is often split across SEVERAL assistant lines sharing the
-//   same `requestId`/`message.id`, each repeating the identical `usage` object.
-//   Usage must be counted once per request or costs double-count.
-// - Tool results arrive as user lines whose message.content[] contains
-//   `tool_result` blocks keyed by `tool_use_id`.
+// Paths, config, small helpers.
 // ---------------------------------------------------------------------------
 
-/**
- * Measure result content. Image blocks are counted separately — their base64
- * payload is NOT text tokens (images bill at a roughly fixed visual-token
- * cost), so counting base64 chars/4 would overstate waste by 10-100x.
- */
+const HOME = homedir();
+const CLAUDE_DIR = join(HOME, ".claude");
+const DATA_DIR = join(CLAUDE_DIR, "agentprof");
+const STATE_DIR = join(DATA_DIR, "state");
+const SESSIONS_DIR = join(DATA_DIR, "sessions");
+const SUMMARY_FILE = join(DATA_DIR, "summary.json");
+const INDEX_FILE = join(STATE_DIR, "index.json");
+const LOCK_FILE = join(STATE_DIR, "refresh.lock");
+const LOCK_TTL_MS = 120_000;
+const PREV_STATUSLINE_FILE = join(DATA_DIR, "prev-statusline.json");
+const SETTINGS_BACKUP_FILE = join(DATA_DIR, "settings.backup.json");
+const INSTALLED_ENGINE = join(DATA_DIR, "agentprof.mjs");
+const SETTINGS_FILE = join(CLAUDE_DIR, "settings.json");
+const PROJECTS_ROOT = join(CLAUDE_DIR, "projects");
+
+const DEFAULT_CONFIG = {
+  stale_turns: 20, // W3: tool results unreferenced for this many requests count as stale
+  tool_output_threshold: 4000, // W4: tokens of a single tool result above which the excess is waste
+  window_days: 30, // longest reporting window; transcripts untouched for longer are not indexed
+  refresh_seconds: 15, // the status line triggers a background re-index at most this often
+  stale_hint_ratio: 0.3, // status line hint "/clear" when stale share of this session's waste >= this
+  mcp_hint_tokens: 10000, // status line hint "prune MCP" when unused MCP definitions >= this
+  cache_ttl_default_ms: 5 * 60 * 1000, // used when a request carries no 5m/1h split
+};
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonAtomic(file, value) {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value));
+  renameSync(tmp, file);
+}
+
+function loadConfig() {
+  const cfg = { ...DEFAULT_CONFIG, ...readJson(join(DATA_DIR, "config.json"), {}) };
+  const override = readJson(join(DATA_DIR, "pricing.json"), null);
+  if (override && typeof override === "object") {
+    for (const [k, v] of Object.entries(override)) {
+      if (v && typeof v.input === "number" && typeof v.output === "number") PRICES[k] = v;
+    }
+  }
+  return cfg;
+}
+
+/** Local-timezone calendar day, "YYYY-MM-DD". */
+function dayOf(ts) {
+  const d = ts instanceof Date ? ts : new Date(ts);
+  if (Number.isNaN(d.getTime())) return undefined;
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function daysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return dayOf(d);
+}
+
+/** Synchronous sleep (used only by the foreground `report` while an index runs). */
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+const CHARS_PER_TOKEN = 4;
+/** Rough per-image visual-token estimate (typical screenshot). */
+const IMAGE_TOKENS = 1600;
+
+const tok = (chars) => Math.round(chars / CHARS_PER_TOKEN);
+
+// ---------------------------------------------------------------------------
+// Parser: one Claude Code transcript file → one "chain" (a main conversation or
+// one subagent run). ~/.claude/projects/<project>/<session>.jsonl is the main
+// chain; <session>/subagents/agent-*.jsonl are sidechains with their own
+// context, so each file is analyzed as its own chain.
+//
+// Format notes (empirically verified; the format is not a documented contract):
+// - Each line is a JSON event; `type` is "user" | "assistant" | "attachment" | ...
+// - One API response is often split across SEVERAL assistant lines sharing the
+//   same `requestId`/`message.id`, repeating the identical `usage`. Count once.
+// - Tool results arrive as user lines whose message.content[] contains
+//   `tool_result` blocks keyed by `tool_use_id`. Only that block's content
+//   entered the model context (large Bash output is persisted to a file and
+//   truncated in context) — the sibling `toolUseResult` field is NOT context.
+// - attachment.type === "prompt_snapshot" carries the system prompt and the
+//   full tool definitions sent to the API (`tools`). Deferred tools (loaded on
+//   demand via ToolSearch) are NOT in it and cost nothing.
+// - Compaction, when present, is marked by `isCompactSummary` on a user line
+//   or a system line with subtype "compact_boundary".
+// - Older Claude Code versions inlined sidechain lines (isSidechain: true)
+//   into the main file; those run in a different context and are skipped.
+// ---------------------------------------------------------------------------
+
 function contentSize(content) {
   if (content == null) return { chars: 0, images: 0 };
   if (typeof content === "string") return { chars: content.length, images: 0 };
@@ -101,20 +201,15 @@ function contentSize(content) {
     let images = 0;
     for (const block of content) {
       if (block && typeof block === "object") {
-        if (block.type === "image") {
-          images += 1;
-        } else if (typeof block.text === "string") {
-          chars += block.text.length;
-        } else if (typeof block.content === "string") {
-          chars += block.content.length;
-        } else {
+        if (block.type === "image") images += 1;
+        else if (typeof block.text === "string") chars += block.text.length;
+        else if (typeof block.content === "string") chars += block.content.length;
+        else {
           const nested = contentSize(block.content);
           if (nested.chars > 0 || nested.images > 0) {
             chars += nested.chars;
             images += nested.images;
-          } else {
-            chars += JSON.stringify(block).length;
-          }
+          } else chars += JSON.stringify(block).length;
         }
       } else if (typeof block === "string") chars += block.length;
     }
@@ -131,11 +226,12 @@ function canonicalJson(value) {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(",")}}`;
 }
 
-/** Trim, drop command/meta noise, cap length. Returns undefined for noise. */
-function cleanPrompt(text) {
-  const trimmed = text.trim();
-  if (!trimmed || trimmed.startsWith("<")) return undefined;
-  return trimmed.slice(0, 300);
+/** Every string inside a tool input, raw (for reference matching). */
+function inputStrings(value, out = []) {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const v of value) inputStrings(v, out);
+  else if (value && typeof value === "object") for (const v of Object.values(value)) inputStrings(v, out);
+  return out;
 }
 
 function normalizeUsage(u) {
@@ -143,31 +239,30 @@ function normalizeUsage(u) {
   const write5m = cc?.ephemeral_5m_input_tokens;
   const write1h = cc?.ephemeral_1h_input_tokens;
   const totalWrite = u?.cache_creation_input_tokens ?? 0;
-  // If the split is absent, attribute all cache-writes to the 5m tier
-  // (the cheaper multiplier — keeps the estimate conservative).
-  const has5m = typeof write5m === "number" || typeof write1h === "number";
+  const hasSplit = typeof write5m === "number" || typeof write1h === "number";
+  const cacheWrite5m = hasSplit ? (write5m ?? 0) : totalWrite; // no split → 5m tier (cheaper; conservative)
+  const cacheWrite1h = hasSplit ? (write1h ?? 0) : 0;
   return {
-    inputTokens: u?.input_tokens ?? 0,
-    outputTokens: u?.output_tokens ?? 0,
-    cacheReadTokens: u?.cache_read_input_tokens ?? 0,
-    cacheWrite5mTokens: has5m ? (write5m ?? 0) : totalWrite,
-    cacheWrite1hTokens: has5m ? (write1h ?? 0) : 0,
+    input: u?.input_tokens ?? 0,
+    output: u?.output_tokens ?? 0,
+    cacheRead: u?.cache_read_input_tokens ?? 0,
+    cacheWrite: cacheWrite5m + cacheWrite1h,
+    cacheWrite5m,
+    cacheWrite1h,
   };
 }
 
-function parseClaudeCodeLog(filePath) {
-  const text = readFileSync(filePath, "utf8");
-  const lines = text.split("\n");
-
-  const stepsByKey = new Map(); // request key -> step under construction
-  const stepOrder = [];
+function parseChain(filePath) {
+  const lines = readFileSync(filePath, "utf8").split("\n");
+  const stepsByKey = new Map();
+  const steps = [];
   const callsById = new Map();
-  const usageSeen = new Set(); // steps whose usage has been captured
-
+  const usageSeen = new Set();
+  const compactionsBeforeStep = new Set(); // step index at which a fresh context begins
+  let toolDefs; // last prompt_snapshot with tools: [{name, tokens}]
   let sessionId = basename(filePath).replace(/\.jsonl$/, "");
   let cwd;
-  let version;
-  let firstUserMessage;
+  let isSidechain; // decided by the first line that says so
   let startTime;
   let endTime;
 
@@ -179,42 +274,44 @@ function parseClaudeCodeLog(filePath) {
     } catch {
       continue;
     }
-
+    if (typeof o.isSidechain === "boolean") {
+      if (isSidechain === undefined) isSidechain = o.isSidechain;
+      else if (o.isSidechain !== isSidechain) continue; // inlined sidechain line in a main file (legacy)
+    }
     if (o.sessionId) sessionId = o.sessionId;
     if (o.cwd && !cwd) cwd = o.cwd;
-    if (o.version && !version) version = o.version;
     if (o.timestamp) {
       if (!startTime) startTime = o.timestamp;
       endTime = o.timestamp;
     }
 
+    if (o.type === "attachment" && o.attachment?.type === "prompt_snapshot" && Array.isArray(o.attachment.tools)) {
+      toolDefs = o.attachment.tools
+        .filter((t) => t && typeof t.name === "string")
+        .map((t) => ({ name: t.name, tokens: tok(JSON.stringify(t).length) }));
+      continue;
+    }
+    if (o.isCompactSummary === true || (o.type === "system" && o.subtype === "compact_boundary")) {
+      compactionsBeforeStep.add(steps.length);
+      continue;
+    }
+
     if (o.type === "assistant" && o.message) {
       const m = o.message;
-      const key = o.requestId ?? m.id ?? o.uuid ?? String(stepOrder.length);
+      const key = o.requestId ?? m.id ?? o.uuid ?? String(steps.length);
       let step = stepsByKey.get(key);
       if (!step) {
         step = {
-          id: m.id ?? o.uuid ?? key,
-          index: stepOrder.length,
-          requestId: o.requestId,
+          index: steps.length,
           timestamp: o.timestamp ?? "",
           model: m.model ?? "unknown",
-          usage: {
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheReadTokens: 0,
-            cacheWrite5mTokens: 0,
-            cacheWrite1hTokens: 0,
-          },
+          usage: normalizeUsage(undefined),
           toolCalls: [],
-          textChars: 0,
-          isSidechain: o.isSidechain === true,
+          texts: [],
         };
         stepsByKey.set(key, step);
-        stepOrder.push(step);
+        steps.push(step);
       }
-      // Usage is identical on every line of the same request — capture it once,
-      // from whichever line of the request carries it first.
       if (m.usage && !usageSeen.has(step)) {
         step.usage = normalizeUsage(m.usage);
         usageSeen.add(step);
@@ -222,120 +319,152 @@ function parseClaudeCodeLog(filePath) {
       if (Array.isArray(m.content)) {
         for (const block of m.content) {
           if (!block || typeof block !== "object") continue;
-          if (block.type === "text" && typeof block.text === "string") {
-            step.textChars += block.text.length;
-          } else if (block.type === "tool_use" && typeof block.id === "string") {
-            if (!callsById.has(block.id)) {
-              const call = {
-                id: block.id,
-                name: typeof block.name === "string" ? block.name : "unknown",
-                input: block.input,
-                inputKey: canonicalJson(block.input ?? null),
-                result: undefined,
-              };
-              callsById.set(block.id, call);
-              step.toolCalls.push(call);
-            }
+          if (block.type === "text" && typeof block.text === "string") step.texts.push(block.text);
+          else if (block.type === "tool_use" && typeof block.id === "string" && !callsById.has(block.id)) {
+            const call = {
+              id: block.id,
+              name: typeof block.name === "string" ? block.name : "unknown",
+              input: block.input,
+              inputKey: canonicalJson(block.input ?? null),
+              step,
+              result: undefined,
+            };
+            callsById.set(block.id, call);
+            step.toolCalls.push(call);
           }
         }
       }
-    } else if (o.type === "user" && o.message) {
-      const content = o.message.content;
-      if (Array.isArray(content)) {
-        let hasToolResult = false;
-        let firstText;
-        for (const block of content) {
-          if (!block || typeof block !== "object") continue;
-          if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
-            hasToolResult = true;
-            const call = callsById.get(block.tool_use_id);
-            if (call) {
-              const size = contentSize(block.content);
-              call.result = {
-                isError: block.is_error === true,
-                contentChars: size.chars,
-                imageCount: size.images,
-                timestamp: o.timestamp,
-              };
-            }
-          } else if (block.type === "text" && typeof block.text === "string" && !firstText) {
-            firstText = block.text;
-          }
-        }
-        // A real user turn can arrive as content blocks (e.g. with attachments).
-        if (!hasToolResult && firstText && !firstUserMessage) {
-          firstUserMessage = cleanPrompt(firstText);
-        }
-      } else if (typeof content === "string" && !firstUserMessage) {
-        firstUserMessage = cleanPrompt(content);
+    } else if (o.type === "user" && o.message && Array.isArray(o.message.content)) {
+      for (const block of o.message.content) {
+        if (!block || typeof block !== "object" || block.type !== "tool_result") continue;
+        const call = callsById.get(block.tool_use_id);
+        if (!call) continue;
+        const size = contentSize(block.content);
+        call.result = {
+          isError: block.is_error === true,
+          tokens: tok(size.chars) + size.images * IMAGE_TOKENS,
+        };
       }
     }
   }
 
   return {
-    sessionId,
-    source: "claude-code",
     filePath,
+    sessionId,
+    isSidechain: isSidechain === true,
     cwd,
-    version,
-    firstUserMessage,
     startTime,
     endTime,
-    steps: stepOrder,
+    steps,
+    toolDefs,
+    compactionsBeforeStep,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Analyzer: cost attribution + waste detection.
+// Analyzer.
 //
-// Waste-cost model: when a tool result of ~T tokens enters the context at
-// step i, the session pays for it roughly as
+// Cost model for context tokens ("carry"): a tool result of T tokens produced
+// at request i enters the prompt of request i+1, where it is written to the
+// cache, and is then re-read (0.1x) by every later request of the same context
+// (until compaction; a fresh context re-writes it). Each token is owned by
+// exactly ONE waste kind, chosen by precedence, so the kinds never overlap and
+// their sum cannot exceed the real cost. Costs are booked on the day of the
+// request that actually paid them.
 //
-//   T x inputPrice x 1.25            (written to cache once)
-// + T x inputPrice x 0.1 x L        (re-read from cache in each of the L later
-//                                    requests of the same chain)
+//   W1 cache miss (confirmed)    prefix broken inside the cache TTL → rewrite
+//                                 (the write-minus-read premium)
+//   W2 duplicate read (confirmed) same file range Read again unchanged;
+//                                 identical read-only calls repeated
+//   W3 stale context (estimated) useful tool results unreferenced for
+//                                 stale_turns requests, still carried
+//   W4 tool output (estimated)   the part of one result above threshold
+//   W5 filler text (estimated)   greetings / progress narration / closing
+//                                 offers in assistant prose (output tokens)
+//   W6 unused tools (confirmed)  MCP tool definitions carried in every
+//                                 request but never called in the chain
+//   W7 retry tax (confirmed)     failed tool calls: error output + the output
+//                                 tokens spent emitting the doomed call
 //
-// This is what persistenceCost computes. It is an estimate (tokens are
-// approximated as chars/4, and context compaction may drop old content), but
-// it reflects the real mechanics of prompt-cached agent loops: everything you
-// put in context is paid for again on every subsequent request.
+// Precedence per result: W7 > W2 > W4 (excess part) > useful; W3 applies to
+// the useful part only. Confirmed = W1 + W2 + W6 + W7. Estimated = W3 + W4 + W5.
+// Not waste: natural cache expiry after the TTL (tracked as expiryCost).
 // ---------------------------------------------------------------------------
 
-const CHARS_PER_TOKEN = 4;
-/** Rough per-image visual-token estimate (typical screenshot at the old cap). */
-const IMAGE_TOKENS = 1600;
+const WASTE = {
+  W1: { label: "cache miss", short: "cache-miss", confirmed: true },
+  W2: { label: "duplicate read", short: "reread", confirmed: true },
+  W3: { label: "stale context", short: "stale", confirmed: false },
+  W4: { label: "tool output", short: "tool-out", confirmed: false },
+  W5: { label: "filler text", short: "filler", confirmed: false },
+  W6: { label: "unused MCP tools", short: "MCP", confirmed: true },
+  W7: { label: "retry tax", short: "retry", confirmed: true },
+};
+const WASTE_KINDS = Object.keys(WASTE);
+const CONFIRMED_KINDS = WASTE_KINDS.filter((k) => WASTE[k].confirmed);
+const ESTIMATED_KINDS = WASTE_KINDS.filter((k) => !WASTE[k].confirmed);
 
-/** Read-only tools whose exact duplicates are always redundant. */
 const READONLY_TOOLS = new Set(["Glob", "Grep", "WebFetch", "WebSearch", "LS", "NotebookRead"]);
-
-/** Tools that modify a file at input.file_path (invalidate earlier reads). */
 const FILE_MUTATING_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
-function resultTokens(result) {
-  if (!result) return 0;
-  return Math.round(result.contentChars / CHARS_PER_TOKEN) + result.imageCount * IMAGE_TOKENS;
+const FILLER_PATTERNS = [
+  /^(sure|certainly|of course|great|got it|absolutely|okay|ok|understood|good question)\b/i,
+  /^(i'?ll|i will|let me|i'?m going to|i am going to|now i'?ll|next,? i'?ll|first,? i'?ll|i'?m now)\b/i,
+  /^(in summary|to summarize|summary:|here'?s what i did|here'?s a summary|i'?ve (now )?(completed|finished|updated|fixed|implemented))\b/i,
+  /^(let me know|feel free|if you (want|need|'?d like|have)|would you like|want me to|shall i|happy to)\b/i,
+];
+
+const PER_DAY_TOP = 30;
+
+function emptyBucket() {
+  const waste = {};
+  for (const k of WASTE_KINDS) waste[k] = { tokens: 0, cost: 0 };
+  return {
+    cost: 0,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    requests: 0,
+    waste,
+    expiryCost: 0,
+    expiryTokens: 0,
+    misses: 0,
+    errors: 0,
+    rereads: {}, // label -> {count, cost}
+    bigOutputs: [], // {label, tokens, cost}
+  };
 }
 
-function stepCost(step) {
-  const p = priceFor(step.model);
-  if (!p) return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-  const u = step.usage;
-  const input = (u.inputTokens / 1e6) * p.input;
-  const output = (u.outputTokens / 1e6) * p.output;
-  const cacheRead = (u.cacheReadTokens / 1e6) * p.input * CACHE_READ_MULT;
-  const cacheWrite =
-    (u.cacheWrite5mTokens / 1e6) * p.input * CACHE_WRITE_5M_MULT +
-    (u.cacheWrite1hTokens / 1e6) * p.input * CACHE_WRITE_1H_MULT;
-  return { input, output, cacheRead, cacheWrite, total: input + output + cacheRead + cacheWrite };
-}
-
-function allCalls(steps) {
-  const out = [];
-  let ordinal = 0;
-  for (const step of steps) {
-    for (const call of step.toolCalls) out.push({ step, call, ordinal: ordinal++ });
+function addBucket(into, from) {
+  into.cost += from.cost;
+  into.requests += from.requests;
+  for (const k of Object.keys(into.tokens)) into.tokens[k] += from.tokens[k] ?? 0;
+  for (const k of WASTE_KINDS) {
+    into.waste[k].tokens += from.waste[k]?.tokens ?? 0;
+    into.waste[k].cost += from.waste[k]?.cost ?? 0;
   }
-  return out;
+  into.expiryCost += from.expiryCost ?? 0;
+  into.expiryTokens += from.expiryTokens ?? 0;
+  into.misses += from.misses ?? 0;
+  into.errors += from.errors ?? 0;
+  for (const [label, e] of Object.entries(from.rereads ?? {})) tally(into.rereads, label, e.count, e.cost);
+  into.bigOutputs.push(...(from.bigOutputs ?? []));
+  return into;
+}
+
+function tally(map, label, count, cost) {
+  const e = (map[label] ??= { count: 0, cost: 0 });
+  e.count += count;
+  e.cost += cost;
+}
+
+const wasteCost = (bucket, kinds = WASTE_KINDS) => kinds.reduce((n, k) => n + bucket.waste[k].cost, 0);
+const wasteTokens = (bucket, kinds = WASTE_KINDS) => kinds.reduce((n, k) => n + bucket.waste[k].tokens, 0);
+const topN = (items, key, n) => [...items].sort((a, b) => b[key] - a[key]).slice(0, n);
+
+/** Keep only the top entries of the per-day lists so records stay small. */
+function trimBucket(b, n = PER_DAY_TOP) {
+  b.rereads = Object.fromEntries(topN(Object.entries(b.rereads).map(([label, e]) => ({ label, ...e })), "cost", n).map((e) => [e.label, { count: e.count, cost: e.cost }]));
+  b.bigOutputs = topN(b.bigOutputs, "cost", n);
+  return b;
 }
 
 function inputFilePath(call) {
@@ -343,773 +472,838 @@ function inputFilePath(call) {
   return typeof p === "string" ? p : undefined;
 }
 
-function truncate(s, n) {
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+function analyzeChain(chain, cfg) {
+  const { steps } = chain;
+  const days = {}; // day -> bucket
+  const unknownModels = new Set();
+  const dayBucket = (step) => (days[dayOf(step.timestamp) ?? "unknown"] ??= emptyBucket());
+
+  // Per-step unit prices ($ per token). Cache-write price follows the TTL the
+  // request actually used; TTL also decides W1 vs natural expiry.
+  const unit = steps.map((s) => {
+    const p = priceFor(s.model);
+    if (!p) {
+      if (s.model !== "<synthetic>" && s.model !== "unknown") unknownModels.add(s.model);
+      return null;
+    }
+    const uses1h = s.usage.cacheWrite1h > 0;
+    return {
+      input: p.input / 1e6,
+      output: p.output / 1e6,
+      read: (p.input * CACHE_READ_MULT) / 1e6,
+      write: (p.input * (uses1h ? CACHE_WRITE_1H_MULT : CACHE_WRITE_5M_MULT)) / 1e6,
+      ttlMs: uses1h ? 60 * 60 * 1000 : s.usage.cacheWrite5m > 0 ? 5 * 60 * 1000 : cfg.cache_ttl_default_ms,
+    };
+  });
+  const hasUsage = (s) => s.usage.input + s.usage.output + s.usage.cacheRead + s.usage.cacheWrite > 0;
+
+  // ---- usage ----
+  for (const s of steps) {
+    const u = unit[s.index];
+    const b = dayBucket(s);
+    b.requests += 1;
+    for (const k of Object.keys(b.tokens)) b.tokens[k] += s.usage[k];
+    if (u) b.cost += s.usage.input * u.input + s.usage.output * u.output + s.usage.cacheRead * u.read + s.usage.cacheWrite * u.write;
+  }
+
+  const addWaste = (kind, step, tokens, cost) => {
+    const b = dayBucket(step);
+    b.waste[kind].tokens += tokens;
+    b.waste[kind].cost += cost;
+  };
+
+  // Steps sharing the context of step i: until the next compaction.
+  const ctxEnd = new Array(steps.length);
+  for (let i = steps.length - 1, end = steps.length; i >= 0; i--) {
+    if (chain.compactionsBeforeStep.has(i + 1)) end = i + 1;
+    ctxEnd[i] = end;
+  }
+  const fresh = (j) => j === 0 || chain.compactionsBeforeStep.has(j);
+  /** Price paid at request j for a token that entered the context at request `entered`. */
+  const carry = (j, entered) => {
+    const u = unit[j];
+    if (!u) return 0;
+    return j === entered || fresh(j) ? u.write : u.read;
+  };
+  /** Book T tokens produced at step i for every later request of the same context, per day. */
+  const chargeSpan = (kind, i, tokens, from = i + 1) => {
+    const end = ctxEnd[i];
+    for (let j = Math.max(from, i + 1); j < end; j++) {
+      const c = tokens * carry(j, i + 1);
+      if (c > 0) addWaste(kind, steps[j], 0, c);
+    }
+  };
+
+  // ---- W1: cache miss vs natural expiry (same model, priced, non-empty requests) ----
+  let prev = -1;
+  for (let i = 0; i < steps.length; i++) {
+    const cur = steps[i];
+    const u = unit[i];
+    if (!u || !hasUsage(cur)) continue;
+    const p = prev;
+    prev = i;
+    if (p < 0 || steps[p].model !== cur.model || ctxEnd[p] <= i) continue;
+    const prevPrefix = steps[p].usage.cacheRead + steps[p].usage.cacheWrite;
+    if (prevPrefix === 0 || cur.usage.cacheWrite === 0 || cur.usage.cacheRead >= prevPrefix) continue;
+    const rewritten = Math.min(cur.usage.cacheWrite, prevPrefix - cur.usage.cacheRead);
+    const dt = Date.parse(cur.timestamp) - Date.parse(steps[p].timestamp);
+    const premium = rewritten * (u.write - u.read); // paid write price where a read would have done
+    const b = dayBucket(cur);
+    if (Number.isFinite(dt) && dt >= 0 && dt < unit[p].ttlMs) {
+      addWaste("W1", cur, rewritten, premium);
+      b.misses += 1;
+    } else {
+      b.expiryTokens += rewritten;
+      b.expiryCost += premium;
+    }
+  }
+
+  // ---- results: W7 > W2 > W4 > useful; W3 on the useful part ----
+  const lastModified = new Map();
+  const seenReads = new Map();
+  const seenCalls = new Set();
+  const useful = []; // {call, i, tokens}
+  const stepRefText = steps.map((s) => [...s.texts, ...s.toolCalls.flatMap((c) => inputStrings(c.input))].join("\n"));
+
+  for (const s of steps) {
+    const i = s.index;
+    const b = dayBucket(s);
+    for (const call of s.toolCalls) {
+      if (FILE_MUTATING_TOOLS.has(call.name)) {
+        const p = inputFilePath(call);
+        if (p) lastModified.set(p, i);
+      }
+      const t = call.result?.tokens ?? 0;
+      let label;
+      let duplicate = false;
+      if (call.name === "Read") {
+        const p = inputFilePath(call);
+        if (p) {
+          const key = `${p}#${call.input?.offset ?? ""}:${call.input?.limit ?? ""}`;
+          const prevRead = seenReads.get(key);
+          seenReads.set(key, i);
+          duplicate = prevRead !== undefined && (lastModified.get(p) ?? -1) <= prevRead;
+          label = p;
+        }
+      } else if (READONLY_TOOLS.has(call.name)) {
+        const key = `${call.name}:${call.inputKey}`;
+        duplicate = seenCalls.has(key);
+        seenCalls.add(key);
+        label = `${call.name} ${summarizeInput(call)}`;
+      }
+
+      if (call.result?.isError) {
+        b.errors += 1;
+        const share = Math.round(s.usage.output / s.toolCalls.length);
+        addWaste("W7", s, t + share, share * (unit[i]?.output ?? 0));
+        chargeSpan("W7", i, t);
+      } else if (duplicate && t > 0) {
+        addWaste("W2", s, t, 0);
+        chargeSpan("W2", i, t);
+        // Attribute the whole span cost to this label for the report.
+        const end = ctxEnd[i];
+        let cost = 0;
+        for (let j = i + 1; j < end; j++) cost += t * carry(j, i + 1);
+        tally(b.rereads, label, 1, cost);
+      } else if (t > 0) {
+        let keep = t;
+        if (t > cfg.tool_output_threshold) {
+          const excess = t - cfg.tool_output_threshold;
+          keep = cfg.tool_output_threshold;
+          addWaste("W4", s, excess, 0);
+          chargeSpan("W4", i, excess);
+          const end = ctxEnd[i];
+          let cost = 0;
+          for (let j = i + 1; j < end; j++) cost += excess * carry(j, i + 1);
+          b.bigOutputs.push({ label: `${call.name} ${summarizeInput(call)}`, tokens: t, cost });
+        }
+        useful.push({ call, i, tokens: keep });
+      }
+    }
+  }
+
+  // ---- W3: useful results unreferenced for stale_turns requests, still carried ----
+  // "Referenced" = the file path (or the call's primary input) appears again in a
+  // later tool input or assistant text.
+  for (const { call, i, tokens } of useful) {
+    const end = ctxEnd[i];
+    if (end - i <= cfg.stale_turns + 1) continue;
+    const ref = inputFilePath(call) ?? refKey(call);
+    let lastRef = i;
+    if (ref) for (let j = i + 1; j < end; j++) if (stepRefText[j].includes(ref)) lastRef = j;
+    const from = lastRef + cfg.stale_turns + 1;
+    if (from >= end) continue;
+    addWaste("W3", steps[from], tokens, 0);
+    chargeSpan("W3", i, tokens, from);
+  }
+
+  // ---- W5: filler prose in assistant output ----
+  for (const s of steps) {
+    const u = unit[s.index];
+    if (!u || !s.texts.length) continue;
+    let chars = 0;
+    for (const text of s.texts) {
+      const prose = text.replace(/```[\s\S]*?```/g, " ");
+      for (const sentence of prose.split(/(?<=[.!?])\s+|\n+/)) {
+        const st = sentence.trim();
+        if (st.length >= 8 && FILLER_PATTERNS.some((re) => re.test(st))) chars += st.length;
+      }
+    }
+    if (chars) addWaste("W5", s, tok(chars), tok(chars) * u.output);
+  }
+
+  // ---- W6: MCP tool definitions never called (carried in every request) ----
+  let unusedMcp = [];
+  if (chain.toolDefs && steps.length) {
+    const used = new Set(steps.flatMap((s) => s.toolCalls.map((c) => c.name)));
+    unusedMcp = topN(
+      chain.toolDefs.filter((t) => t.name.startsWith("mcp__") && !used.has(t.name)).map((t) => ({ label: t.name, tokens: t.tokens })),
+      "tokens",
+      50,
+    );
+    const tokens = unusedMcp.reduce((n, t) => n + t.tokens, 0);
+    if (tokens > 0) {
+      for (const s of steps) {
+        const j = s.index;
+        addWaste("W6", s, fresh(j) ? tokens : 0, tokens * carry(j, 0));
+      }
+    }
+  }
+
+  for (const b of Object.values(days)) trimBucket(b);
+
+  return {
+    version: VERSION,
+    key: chainKey(chain.filePath),
+    file: chain.filePath,
+    sessionId: chain.sessionId,
+    isSidechain: chain.isSidechain,
+    project: chain.cwd ?? projectFromPath(chain.filePath),
+    models: [...new Set(steps.map((s) => s.model))].filter((m) => m !== "<synthetic>"),
+    startTime: chain.startTime,
+    endTime: chain.endTime,
+    requests: steps.length,
+    days,
+    unusedMcp,
+    unknownModels: [...unknownModels],
+  };
+}
+
+function refKey(call) {
+  const input = call.input;
+  if (!input || typeof input !== "object") return undefined;
+  for (const key of ["pattern", "query", "url"]) if (typeof input[key] === "string" && input[key].length >= 4) return input[key];
+  return undefined;
 }
 
 function summarizeInput(call) {
   const input = call.input;
   if (!input || typeof input !== "object") return "";
-  for (const key of ["pattern", "query", "url", "file_path", "path", "command"]) {
-    if (typeof input[key] === "string") return truncate(input[key], 80);
+  for (const key of ["pattern", "query", "url", "file_path", "path", "command", "description"]) {
+    if (typeof input[key] === "string") return truncate(input[key].replace(/\s+/g, " "), 70);
   }
-  return truncate(JSON.stringify(input), 80);
+  return truncate(JSON.stringify(input), 70);
 }
 
-/**
- * Reread Ratio: the same file Read more than once with no modification of that
- * file in between. The repeated read's actual result size is counted as waste
- * (so partial re-reads are only partially penalized). Keys are chain-scoped
- * ("m:" main / "s:" sidechain): a read repeated in a DIFFERENT chain runs in a
- * separate context and is not redundant there.
- */
-function detectRereads(steps, persistenceCost) {
-  const calls = allCalls(steps);
-  const lastModified = new Map(); // chain:path -> ordinal of last modification
-  const lastRead = new Map(); // chain:path -> ordinal of last read
-  const wasteByFile = new Map();
+function truncate(s, n) {
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
 
-  for (const { call, step, ordinal } of calls) {
-    if (FILE_MUTATING_TOOLS.has(call.name)) {
-      const p = inputFilePath(call);
-      // A modification invalidates earlier reads in every chain (the file on
-      // disk changed for both), so record it under both chain keys.
-      if (p) {
-        lastModified.set(`m:${p}`, ordinal);
-        lastModified.set(`s:${p}`, ordinal);
+function chainKey(file) {
+  // Stable, filesystem-safe id for a transcript file.
+  return file.replace(PROJECTS_ROOT, "").replace(/^[\\/]/, "").replace(/[\\/]/g, "__").replace(/\.jsonl$/, "");
+}
+
+function projectFromPath(file) {
+  const rel = file.slice(PROJECTS_ROOT.length + 1);
+  return rel.split(/[\\/]/)[0] ?? "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// Store + refresh: incremental index of every transcript touched in the last
+// window_days, one record per chain, summed into summary.json.
+// ---------------------------------------------------------------------------
+
+function findJsonl(dir, out = []) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) findJsonl(p, out);
+    else if (e.isFile() && e.name.endsWith(".jsonl")) out.push(p);
+  }
+  return out;
+}
+
+function lockIsFresh() {
+  const lock = readJson(LOCK_FILE, null);
+  return !!lock && Date.now() - lock.time < LOCK_TTL_MS;
+}
+
+/** Atomic (O_EXCL) lock; a lock older than LOCK_TTL_MS is treated as abandoned. */
+function acquireLock() {
+  mkdirSync(STATE_DIR, { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(LOCK_FILE, "wx");
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, time: Date.now() }));
+      closeSync(fd);
+      return true;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      if (lockIsFresh()) return false;
+      try {
+        unlinkSync(LOCK_FILE);
+      } catch {}
+    }
+  }
+  return false;
+}
+
+function touchLock() {
+  try {
+    writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, time: Date.now() }));
+  } catch {}
+}
+
+function releaseLock() {
+  try {
+    if (readJson(LOCK_FILE, null)?.pid === process.pid) unlinkSync(LOCK_FILE);
+  } catch {}
+}
+
+function refresh({ quiet = false } = {}) {
+  const cfg = loadConfig();
+  if (!acquireLock()) {
+    if (!quiet) console.error("another refresh is running");
+    return null;
+  }
+  try {
+    mkdirSync(SESSIONS_DIR, { recursive: true });
+    let index = readJson(INDEX_FILE, null);
+    if (!index || index.version !== VERSION || !index.files) {
+      // Schema changed (or first run): rebuild every record.
+      rmSync(SESSIONS_DIR, { recursive: true, force: true });
+      mkdirSync(SESSIONS_DIR, { recursive: true });
+      index = { version: VERSION, files: {} };
+    }
+    const cutoff = Date.now() - (cfg.window_days + 1) * 86_400_000;
+    const files = findJsonl(PROJECTS_ROOT);
+    const live = new Set();
+    let parsed = 0;
+    let failed = 0;
+    let n = 0;
+    for (const file of files) {
+      if (++n % 25 === 0) touchLock();
+      let st;
+      try {
+        st = statSync(file);
+      } catch {
+        continue;
       }
-      continue;
+      if (st.mtimeMs < cutoff) continue;
+      const key = chainKey(file);
+      live.add(key);
+      const prev = index.files[key];
+      if (prev && prev.size === st.size && prev.mtime === st.mtimeMs) continue;
+      try {
+        writeJsonAtomic(join(SESSIONS_DIR, `${key}.json`), analyzeChain(parseChain(file), cfg));
+        index.files[key] = { size: st.size, mtime: st.mtimeMs, file };
+        parsed += 1;
+      } catch (err) {
+        // Remember the failure so the file is retried only when it changes.
+        index.files[key] = { size: st.size, mtime: st.mtimeMs, file, error: String(err.message ?? err).slice(0, 200) };
+        failed += 1;
+        if (!quiet) console.error(`skip ${file}: ${err.message}`);
+      }
     }
-    if (call.name !== "Read") continue;
-    const p = inputFilePath(call);
-    if (!p) continue;
-    const key = `${step.isSidechain ? "s" : "m"}:${p}`;
-    const prevRead = lastRead.get(key);
-    lastRead.set(key, ordinal);
-    if (prevRead === undefined) continue;
-    if ((lastModified.get(key) ?? -1) > prevRead) continue; // legitimate re-read after an edit
-    const tokens = resultTokens(call.result);
-    if (tokens === 0) continue;
-    const entry = wasteByFile.get(p) ?? {
-      occurrences: 0,
-      wastedTokens: 0,
-      wastedCost: 0,
-      stepIndices: [],
-    };
-    entry.occurrences += 1;
-    entry.wastedTokens += tokens;
-    entry.wastedCost += persistenceCost(tokens, step);
-    entry.stepIndices.push(step.index);
-    wasteByFile.set(p, entry);
+    for (const key of Object.keys(index.files)) {
+      if (!live.has(key)) {
+        delete index.files[key];
+        try {
+          unlinkSync(join(SESSIONS_DIR, `${key}.json`));
+        } catch {}
+      }
+    }
+    writeJsonAtomic(INDEX_FILE, index);
+    const summary = buildSummary(cfg);
+    summary.files = live.size;
+    summary.failedFiles = Object.values(index.files).filter((f) => f.error).length;
+    summary.parsedNow = parsed;
+    writeJsonAtomic(SUMMARY_FILE, summary);
+    return summary;
+  } finally {
+    releaseLock();
   }
-
-  return [...wasteByFile.entries()].map(([file, e]) => ({ kind: "reread", label: file, ...e }));
 }
 
-/**
- * Duplicate calls: exact same read-only tool + identical input, repeated in the
- * same chain. Stateful tools (Bash etc.) are deliberately excluded — repeating
- * them can be legitimate. Read has its own detector above.
- */
-function detectDuplicateCalls(steps, persistenceCost) {
-  const calls = allCalls(steps);
-  const seen = new Set();
-  const wasteByKey = new Map();
-
-  for (const { call, step } of calls) {
-    if (!READONLY_TOOLS.has(call.name)) continue;
-    const key = `${step.isSidechain ? "s" : "m"}:${call.name} ${call.inputKey}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      continue;
-    }
-    const tokens = resultTokens(call.result);
-    const entry = wasteByKey.get(key) ?? {
-      label: `${call.name} ${summarizeInput(call)}`,
-      occurrences: 0,
-      wastedTokens: 0,
-      wastedCost: 0,
-      stepIndices: [],
-    };
-    entry.occurrences += 1;
-    entry.wastedTokens += tokens;
-    entry.wastedCost += persistenceCost(tokens, step);
-    entry.stepIndices.push(step.index);
-    wasteByKey.set(key, entry);
+function loadRecords() {
+  let names;
+  try {
+    names = readdirSync(SESSIONS_DIR);
+  } catch {
+    return [];
   }
-
-  return [...wasteByKey.values()].map((e) => ({ kind: "duplicate-call", ...e }));
+  const out = [];
+  for (const n of names) {
+    if (!n.endsWith(".json")) continue;
+    const r = readJson(join(SESSIONS_DIR, n), null);
+    if (r && r.version === VERSION && r.days) out.push(r);
+  }
+  return out;
 }
 
-/**
- * Retry Tax: failed tool calls. Waste counted = the error output that entered
- * context, plus the share of the step's output tokens spent emitting the
- * failed call(s).
- */
-function detectRetries(steps, stepCosts, persistenceCost) {
-  const wasteByTool = new Map();
-
-  for (const { step, cost } of stepCosts) {
-    const failed = step.toolCalls.filter((c) => c.result?.isError);
-    if (failed.length === 0) continue;
-    const share = failed.length / step.toolCalls.length;
-    for (const call of failed) {
-      const tokens = resultTokens(call.result);
-      const entry = wasteByTool.get(call.name) ?? {
-        occurrences: 0,
-        wastedTokens: 0,
-        wastedCost: 0,
-        stepIndices: [],
-      };
-      entry.occurrences += 1;
-      entry.wastedTokens += tokens;
-      entry.wastedCost += persistenceCost(tokens, step);
-      entry.stepIndices.push(step.index);
-      wasteByTool.set(call.name, entry);
-    }
-    // spread the step's output cost share over its failed calls (added once)
-    const entry = wasteByTool.get(failed[0].name);
-    if (entry) entry.wastedCost += cost.output * share;
-  }
-
-  return [...wasteByTool.entries()].map(([tool, e]) => ({ kind: "retry", label: tool, ...e }));
-}
-
-function computeToolStats(steps, persistenceCost) {
-  const stats = new Map();
-  for (const step of steps) {
-    for (const call of step.toolCalls) {
-      const s = stats.get(call.name) ?? {
-        name: call.name,
-        calls: 0,
-        errors: 0,
-        resultTokens: 0,
-        estContextCost: 0,
-      };
-      s.calls += 1;
-      if (call.result?.isError) s.errors += 1;
-      const tokens = resultTokens(call.result);
-      s.resultTokens += tokens;
-      s.estContextCost += persistenceCost(tokens, step);
-      stats.set(call.name, s);
-    }
-  }
-  return [...stats.values()].sort((a, b) => b.estContextCost - a.estContextCost);
-}
-
-function profileSession(trajectory) {
-  const steps = trajectory.steps;
-  const stepCosts = steps.map((s) => ({ step: s, cost: stepCost(s) }));
-
-  const totalCost = stepCosts.reduce(
-    (acc, sc) => ({
-      input: acc.input + sc.cost.input,
-      output: acc.output + sc.cost.output,
-      cacheRead: acc.cacheRead + sc.cost.cacheRead,
-      cacheWrite: acc.cacheWrite + sc.cost.cacheWrite,
-      total: acc.total + sc.cost.total,
-    }),
-    { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  );
-
-  const totalUsage = steps.reduce(
-    (acc, s) => ({
-      inputTokens: acc.inputTokens + s.usage.inputTokens,
-      outputTokens: acc.outputTokens + s.usage.outputTokens,
-      cacheReadTokens: acc.cacheReadTokens + s.usage.cacheReadTokens,
-      cacheWrite5mTokens: acc.cacheWrite5mTokens + s.usage.cacheWrite5mTokens,
-      cacheWrite1hTokens: acc.cacheWrite1hTokens + s.usage.cacheWrite1hTokens,
-    }),
-    { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWrite5mTokens: 0, cacheWrite1hTokens: 0 },
-  );
-
-  const unknownModels = [
-    ...new Set(
-      steps.filter((s) => !priceFor(s.model) && s.model !== "<synthetic>").map((s) => s.model),
-    ),
-  ];
-
-  // How many later requests re-read context added at a given step. Precomputed
-  // per chain (main vs sidechain) so persistenceCost is O(1) per call.
-  const totalMain = steps.filter((s) => !s.isSidechain).length;
-  const totalSide = steps.length - totalMain;
-  const laterCount = new Array(steps.length).fill(0);
-  let seenMain = 0;
-  let seenSide = 0;
-  for (const s of steps) {
-    if (s.isSidechain) {
-      seenSide += 1;
-      laterCount[s.index] = totalSide - seenSide;
-    } else {
-      seenMain += 1;
-      laterCount[s.index] = totalMain - seenMain;
-    }
-  }
-
-  const persistenceCost = (tokens, step) => {
-    const p = priceFor(step.model);
-    if (!p) return 0;
-    return (
-      (tokens / 1e6) *
-      p.input *
-      (CACHE_WRITE_5M_MULT + CACHE_READ_MULT * (laterCount[step.index] ?? 0))
-    );
-  };
-
-  const findings = [
-    ...detectRereads(steps, persistenceCost),
-    ...detectDuplicateCalls(steps, persistenceCost),
-    ...detectRetries(steps, stepCosts, persistenceCost),
-  ].sort((a, b) => b.wastedCost - a.wastedCost);
-
-  const wastedCost = findings.reduce((n, f) => n + f.wastedCost, 0);
-  const wastedTokens = findings.reduce((n, f) => n + f.wastedTokens, 0);
-
-  const durationMs =
-    trajectory.startTime && trajectory.endTime
-      ? Date.parse(trajectory.endTime) - Date.parse(trajectory.startTime)
-      : 0;
-
+function summarizeBucket(b) {
+  const confirmedCost = wasteCost(b, CONFIRMED_KINDS);
+  const estimatedCost = wasteCost(b, ESTIMATED_KINDS);
+  const usageTokens = Object.values(b.tokens).reduce((n, v) => n + v, 0);
   return {
-    trajectory,
-    stepCosts,
-    totalCost,
-    totalUsage,
-    durationMs,
-    findings,
-    wastedCost,
-    wastedTokens,
-    wasteRatio: totalCost.total > 0 ? wastedCost / totalCost.total : 0,
-    toolStats: computeToolStats(steps, persistenceCost),
-    unknownModels,
+    confirmedCost,
+    estimatedCost,
+    wasteCost: confirmedCost + estimatedCost,
+    wasteRatioConfirmed: b.cost > 0 ? confirmedCost / b.cost : 0,
+    wasteRatioTotal: b.cost > 0 ? (confirmedCost + estimatedCost) / b.cost : 0,
+    wasteRatioTokens: usageTokens > 0 ? wasteTokens(b) / usageTokens : 0,
   };
 }
 
+function buildSummary(cfg) {
+  const records = loadRecords();
+  const today = daysAgo(0);
+  const windows = { today: [today, today], d7: [daysAgo(6), today], d30: [daysAgo(cfg.window_days - 1), today] };
+  const out = { generatedAt: new Date().toISOString(), version: VERSION, pricingRevised: PRICING_REVISED, windows: {}, sessions: {}, unknownModels: [] };
+  const unknown = new Set();
+  for (const r of records) for (const m of r.unknownModels) unknown.add(m);
+
+  for (const [name, [from, to]] of Object.entries(windows)) {
+    const total = emptyBucket();
+    const projects = new Map();
+    const sessions = new Map();
+    const unusedMcp = new Map();
+    for (const r of records) {
+      let touched = false;
+      for (const [day, b] of Object.entries(r.days)) {
+        if (day < from || day > to) continue;
+        touched = true;
+        addBucket(total, b);
+        addBucket(projects.get(r.project) ?? projects.set(r.project, emptyBucket()).get(r.project), b);
+        let sess = sessions.get(r.sessionId);
+        if (!sess) sessions.set(r.sessionId, (sess = { bucket: emptyBucket(), sessionId: r.sessionId, project: r.project, models: new Set(), endTime: r.endTime ?? "" }));
+        addBucket(sess.bucket, b);
+        for (const m of r.models) sess.models.add(m);
+        if ((r.endTime ?? "") > sess.endTime) sess.endTime = r.endTime;
+      }
+      if (!touched) continue;
+      for (const e of r.unusedMcp) {
+        const x = unusedMcp.get(e.label) ?? { label: e.label, tokens: 0, chains: 0 };
+        x.tokens = Math.max(x.tokens, e.tokens);
+        x.chains += 1;
+        unusedMcp.set(e.label, x);
+      }
+    }
+    const rereads = Object.entries(total.rereads).map(([label, e]) => ({ label, ...e }));
+    out.windows[name] = {
+      from,
+      to,
+      cost: total.cost,
+      requests: total.requests,
+      tokens: total.tokens,
+      waste: total.waste,
+      expiryCost: total.expiryCost,
+      expiryTokens: total.expiryTokens,
+      misses: total.misses,
+      errors: total.errors,
+      ...summarizeBucket(total),
+      sessions: sessions.size,
+      projects: topN(
+        [...projects.entries()].map(([project, b]) => ({ project, cost: b.cost, wasteCost: wasteCost(b) })),
+        "cost",
+        15,
+      ),
+      topSessions: topN(
+        [...sessions.values()].map((s) => ({ sessionId: s.sessionId, project: s.project, models: [...s.models], endTime: s.endTime, cost: s.bucket.cost, wasteCost: wasteCost(s.bucket) })),
+        "cost",
+        10,
+      ),
+      topRereads: topN(rereads, "cost", 10),
+      unusedMcp: topN([...unusedMcp.values()], "tokens", 15),
+      unusedMcpTokens: [...unusedMcp.values()].reduce((n, e) => n + e.tokens, 0),
+      bigOutputs: topN(total.bigOutputs, "cost", 10),
+    };
+  }
+
+  // Per-session figures for the status line hints (main chains active in the last 2 days).
+  const recent = daysAgo(1);
+  for (const r of records) {
+    if (r.isSidechain || (dayOf(r.endTime) ?? "") < recent) continue;
+    const b = emptyBucket();
+    for (const day of Object.keys(r.days)) if (day >= recent) addBucket(b, r.days[day]);
+    const wc = wasteCost(b);
+    out.sessions[r.sessionId] = {
+      cost: b.cost,
+      wasteCost: wc,
+      staleShare: wc > 0 ? b.waste.W3.cost / wc : 0,
+      unusedMcpTokens: r.unusedMcp.reduce((n, e) => n + e.tokens, 0),
+      requests: r.requests,
+    };
+  }
+  out.unknownModels = [...unknown];
+  // Savings schema (reserved for interventions in a later version).
+  out.savings = { baseline: null, interventions: [], measured: {}, estimated: null, holdoutRatio: 0 };
+  return out;
+}
+
+/** A summary this engine version can render. */
+function validSummary(s) {
+  return !!s && s.version === VERSION && !!s.windows?.today && !!s.windows?.d7 && !!s.windows?.d30 && Number.isFinite(Date.parse(s.generatedAt));
+}
+
+function summaryIsStale(summary, cfg) {
+  return !validSummary(summary) || Date.now() - Date.parse(summary.generatedAt) > cfg.refresh_seconds * 1000;
+}
+
+function spawnRefresh() {
+  if (lockIsFresh()) return; // an index is already running
+  const engine = fileURLToPath(import.meta.url);
+  try {
+    const child = spawn(process.execPath, [engine, "refresh", "--quiet"], { detached: true, stdio: "ignore", windowsHide: true });
+    child.unref();
+  } catch {}
+}
+
 // ---------------------------------------------------------------------------
-// HTML report: a single self-contained file. No external assets, no CDN, no
-// JS frameworks — open it, share it, attach it.
+// Formatting.
 // ---------------------------------------------------------------------------
 
-const esc = (s) =>
-  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function palette(enabled) {
+  const c = (code) => (enabled ? `\x1b[${code}m` : "");
+  return { reset: c(0), bold: c(1), dim: c(2), red: c(31), green: c(32), yellow: c(33) };
+}
+// Terminal output honours isTTY; the status line is always coloured (Claude
+// Code renders ANSI there even though stdout is a pipe).
+const C = palette(process.stdout.isTTY || process.env.AGENTPROF_COLOR === "1");
 
-const usd = (n) => (n >= 100 ? `$${n.toFixed(0)}` : n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(3)}`);
-
+const usd = (n) => (n >= 100 ? `$${n.toFixed(0)}` : n >= 10 ? `$${n.toFixed(1)}` : n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(3)}`);
+const pct = (x, d = 0) => `${(x * 100).toFixed(d)}%`;
 const compact = (n) => {
   if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
-  return String(n);
+  return String(Math.round(n));
 };
 
-const pct = (x) => (x * 100).toFixed(1) + "%";
+function shortModel(id) {
+  if (!id) return "Claude";
+  const m = /claude-([a-z]+)-(\d+)(?:-(\d+))?/.exec(id);
+  if (!m) return id;
+  const name = m[1][0].toUpperCase() + m[1].slice(1);
+  return `${name} ${m[2]}${m[3] ? "." + m[3] : ""}`;
+}
 
-const KIND_LABEL = { reread: "Reread", "duplicate-call": "Duplicate call", retry: "Retry Tax" };
-const KIND_COLOR = { reread: "#f59e0b", "duplicate-call": "#a78bfa", retry: "#ef4444" };
+// ---------------------------------------------------------------------------
+// Status line. Reads summary.json only (never parses transcripts); kicks a
+// background refresh when the summary is stale and no index is running.
+// Chains the status line that was configured before `on`, if any.
+// ---------------------------------------------------------------------------
 
-function renderReport(profile) {
-  const t = profile.trajectory;
-  const durationMin = profile.durationMs / 60000;
-  const models = [...new Set(t.steps.map((s) => s.model))].filter((m) => m !== "<synthetic>");
-  const toolCallCount = t.steps.reduce((n, s) => n + s.toolCalls.length, 0);
-  const wasteStepSet = new Set(profile.findings.flatMap((f) => f.stepIndices));
+function readStdin() {
+  let raw = "";
+  try {
+    raw = readFileSync(0, "utf8");
+  } catch {}
+  let json = {};
+  try {
+    json = raw.trim() ? JSON.parse(raw) : {};
+  } catch {}
+  return { raw, json };
+}
 
-  // ---- timeline bars (sqrt scale so one giant request doesn't flatten the rest) ----
-  const maxStepCost = Math.max(...profile.stepCosts.map((sc) => sc.cost.total), 1e-9);
-  const bars = profile.stepCosts
-    .map((sc) => {
-      const c = sc.cost;
-      const scale = Math.sqrt(c.total / maxStepCost);
-      const h = (seg) => (c.total > 0 ? Math.max((seg / c.total) * scale * 100, 0) : 0);
-      const wasted = wasteStepSet.has(sc.step.index);
-      const tip = `Step ${sc.step.index + 1} — ${esc(sc.step.model)}\n${usd(c.total)} total\ncache read ${usd(c.cacheRead)} · cache write ${usd(c.cacheWrite)}\ninput ${usd(c.input)} · output ${usd(c.output)}\n${sc.step.toolCalls.map((x) => x.name).join(", ") || "no tools"}`;
-      return `<div class="bar${wasted ? " wasted" : ""}${sc.step.isSidechain ? " side" : ""}" data-tip="${esc(tip)}">
-        <i class="s-cw" style="height:${h(c.cacheWrite)}%"></i>
-        <i class="s-cr" style="height:${h(c.cacheRead)}%"></i>
-        <i class="s-in" style="height:${h(c.input)}%"></i>
-        <i class="s-out" style="height:${h(c.output)}%"></i>
-      </div>`;
-    })
-    .join("");
-
-  // ---- context snowball (context size ≈ input + cacheRead + cacheWrite per request) ----
-  const ctxSizes = profile.stepCosts.map(
-    (sc) =>
-      sc.step.usage.inputTokens +
-      sc.step.usage.cacheReadTokens +
-      sc.step.usage.cacheWrite5mTokens +
-      sc.step.usage.cacheWrite1hTokens,
-  );
-  const maxCtx = Math.max(...ctxSizes, 1);
-  const W = 1000;
-  const H = 120;
-  const pts = ctxSizes
-    .map((v, i) => {
-      const x = ctxSizes.length > 1 ? (i / (ctxSizes.length - 1)) * W : 0;
-      const y = H - (v / maxCtx) * H;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
-  const contextChart = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:120px;display:block">
-    <polygon points="0,${H} ${pts} ${W},${H}" fill="#3b82f622"/>
-    <polyline points="${pts}" fill="none" stroke="#60a5fa" stroke-width="1.5"/>
-  </svg>
-  <div class="legend"><span>peak context ${compact(maxCtx)} tokens · every request re-pays its full context (cached tokens at 0.1× input price)</span></div>`;
-
-  // ---- findings rows ----
-  const findingRows = profile.findings
-    .slice(0, 60)
-    .map(
-      (f) => `<tr>
-      <td><span class="badge" style="background:${KIND_COLOR[f.kind]}22;color:${KIND_COLOR[f.kind]}">${KIND_LABEL[f.kind]}</span></td>
-      <td class="mono label">${esc(f.label)}</td>
-      <td class="num">${f.occurrences}×</td>
-      <td class="num">${compact(f.wastedTokens)}</td>
-      <td class="num cost">${usd(f.wastedCost)}</td>
-    </tr>`,
-    )
-    .join("");
-
-  const wasteByKind = ["reread", "duplicate-call", "retry"].map((k) => {
-    const fs = profile.findings.filter((f) => f.kind === k);
-    return {
-      kind: k,
-      cost: fs.reduce((n, f) => n + f.wastedCost, 0),
-    };
+function runPreviousStatusLine(prev, rawStdin) {
+  return new Promise((done) => {
+    const cmd = prev?.value?.command;
+    if (!cmd) return done("");
+    const win = process.platform === "win32";
+    const child = execFile(win ? "cmd" : "sh", [win ? "/c" : "-c", cmd], { timeout: 1500, maxBuffer: 1 << 20, windowsVerbatimArguments: win, windowsHide: true }, (_err, stdout) => done(stdout ?? ""));
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(rawStdin);
   });
-
-  const wasteKindBar = wasteByKind
-    .filter((w) => w.cost > 0)
-    .map(
-      (w) =>
-        `<div style="flex:${Math.max(w.cost, 1e-9)};background:${KIND_COLOR[w.kind]}" title="${KIND_LABEL[w.kind]}: ${usd(w.cost)}"></div>`,
-    )
-    .join("");
-
-  const toolRows = profile.toolStats
-    .slice(0, 20)
-    .map(
-      (s) => `<tr>
-      <td class="mono">${esc(s.name)}</td>
-      <td class="num">${s.calls}</td>
-      <td class="num">${s.errors > 0 ? `<span class="err">${s.errors}</span>` : "0"}</td>
-      <td class="num">${compact(s.resultTokens)}</td>
-      <td class="num cost">${usd(s.estContextCost)}</td>
-    </tr>`,
-    )
-    .join("");
-
-  const unknownNote = profile.unknownModels.length
-    ? `<p class="note warn">⚠ Unknown model pricing for: ${profile.unknownModels.map(esc).join(", ")} — their cost is counted as $0.</p>`
-    : "";
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>agentprof — ${esc(t.sessionId.slice(0, 8))}</title>
-<style>
-  :root {
-    --bg: #0b0e14; --panel: #12161f; --border: #1f2633;
-    --text: #e6e9ef; --dim: #8b94a7;
-    --cr: #3b82f6; --cw: #22d3ee; --in: #34d399; --out: #f472b6;
-    --waste: #ef4444;
-  }
-  * { box-sizing: border-box; margin: 0; }
-  body { background: var(--bg); color: var(--text); font: 14px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; padding: 32px 24px 64px; max-width: 1080px; margin: 0 auto; }
-  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; }
-  header { margin-bottom: 24px; }
-  header h1 { font-size: 20px; letter-spacing: -0.02em; }
-  header h1 b { color: #60a5fa; }
-  header .meta { color: var(--dim); margin-top: 6px; font-size: 13px; }
-  .prompt { color: var(--dim); font-style: italic; margin-top: 8px; border-left: 3px solid var(--border); padding-left: 10px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
-  .card .k { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
-  .card .v { font-size: 24px; font-weight: 650; margin-top: 4px; letter-spacing: -0.02em; }
-  .card.waste .v { color: var(--waste); }
-  .card .sub { color: var(--dim); font-size: 12px; margin-top: 2px; }
-  section { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin: 16px 0; }
-  section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); margin-bottom: 12px; }
-  .timeline { display: flex; align-items: flex-end; gap: 2px; height: 140px; overflow-x: auto; padding-bottom: 4px; }
-  .bar { position: relative; flex: 1 0 6px; max-width: 22px; height: 100%; display: flex; flex-direction: column-reverse; cursor: default; border-radius: 2px 2px 0 0; overflow: visible; }
-  .bar i { display: block; width: 100%; }
-  .bar .s-cr { background: var(--cr); } .bar .s-cw { background: var(--cw); }
-  .bar .s-in { background: var(--in); } .bar .s-out { background: var(--out); }
-  .bar.wasted::after { content: ""; position: absolute; top: -8px; left: 50%; transform: translateX(-50%); width: 5px; height: 5px; border-radius: 50%; background: var(--waste); }
-  .bar.side { opacity: 0.55; }
-  .bar:hover { outline: 1px solid #ffffff55; }
-  .bar:hover::before { content: attr(data-tip); position: absolute; bottom: 105%; left: 0; z-index: 10; white-space: pre; background: #000000ee; border: 1px solid var(--border); color: var(--text); font-size: 11.5px; padding: 8px 10px; border-radius: 8px; pointer-events: none; }
-  .legend { display: flex; gap: 16px; color: var(--dim); font-size: 12px; margin-top: 10px; flex-wrap: wrap; }
-  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
-  .wastebar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; gap: 2px; margin: 6px 0 14px; }
-  table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; color: var(--dim); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; padding: 6px 8px; border-bottom: 1px solid var(--border); }
-  td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  tr:last-child td { border-bottom: none; }
-  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .cost { font-weight: 600; }
-  .label { word-break: break-all; color: #c9d1de; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
-  .err { color: var(--waste); font-weight: 600; }
-  .note { color: var(--dim); font-size: 12.5px; margin-top: 10px; }
-  .note.warn { color: #f59e0b; }
-  footer { color: var(--dim); font-size: 12px; margin-top: 28px; }
-  footer a { color: #60a5fa; text-decoration: none; }
-</style>
-</head>
-<body>
-<header>
-  <h1><b>agentprof</b> · session profile</h1>
-  <div class="meta mono">${esc(t.sessionId)} · ${esc(t.cwd ?? "")} · ${models.map(esc).join(", ")} · ${t.steps.length} steps · ${toolCallCount} tool calls · ${durationMin > 90 ? (durationMin / 60).toFixed(1) + " h" : durationMin.toFixed(0) + " min"}</div>
-  ${t.firstUserMessage ? `<div class="prompt">“${esc(t.firstUserMessage)}”</div>` : ""}
-</header>
-
-<div class="cards">
-  <div class="card"><div class="k">Total cost</div><div class="v">${usd(profile.totalCost.total)}</div><div class="sub">list price, cache-aware</div></div>
-  <div class="card waste"><div class="k">Estimated waste</div><div class="v">${usd(profile.wastedCost)}</div><div class="sub">${pct(profile.wasteRatio)} of total</div></div>
-  <div class="card"><div class="k">Tokens in</div><div class="v">${compact(profile.totalUsage.inputTokens + profile.totalUsage.cacheReadTokens + profile.totalUsage.cacheWrite5mTokens + profile.totalUsage.cacheWrite1hTokens)}</div><div class="sub">${compact(profile.totalUsage.cacheReadTokens)} from cache</div></div>
-  <div class="card"><div class="k">Tokens out</div><div class="v">${compact(profile.totalUsage.outputTokens)}</div><div class="sub">across ${t.steps.length} requests</div></div>
-</div>
-
-<section>
-  <h2>Cost per request</h2>
-  <div class="timeline">${bars}</div>
-  <div class="legend">
-    <span><i style="background:var(--cw)"></i>cache write</span>
-    <span><i style="background:var(--cr)"></i>cache read</span>
-    <span><i style="background:var(--in)"></i>input</span>
-    <span><i style="background:var(--out)"></i>output</span>
-    <span><i style="background:var(--waste);border-radius:50%"></i>waste detected in step</span>
-  </div>
-</section>
-
-<section>
-  <h2>Context snowball — tokens carried into each request</h2>
-  ${contextChart}
-</section>
-
-<section>
-  <h2>Where money leaked — ${usd(profile.wastedCost)} (${pct(profile.wasteRatio)})</h2>
-  ${wasteKindBar ? `<div class="wastebar">${wasteKindBar}</div>` : ""}
-  <table>
-    <thead><tr><th>Kind</th><th>What</th><th>Repeats</th><th>Tokens</th><th>Est. cost</th></tr></thead>
-    <tbody>${findingRows || `<tr><td colspan="5" class="note">No waste detected 🎉</td></tr>`}</tbody>
-  </table>
-  <p class="note">Waste cost = tokens × input price × (1.25 cache-write + 0.1 × each later request that re-reads them from cache). Tokens estimated at 4 chars/token. Re-reads after the file was edited are <em>not</em> counted.</p>
-</section>
-
-<section>
-  <h2>Context cost by tool</h2>
-  <table>
-    <thead><tr><th>Tool</th><th>Calls</th><th>Errors</th><th>Result tokens</th><th>Est. context cost</th></tr></thead>
-    <tbody>${toolRows}</tbody>
-  </table>
-</section>
-
-${unknownNote}
-<footer>Generated by <a href="https://github.com/Shawn-Son/agentprof">agentprof</a> — measure, optimize, prove.</footer>
-</body>
-</html>`;
 }
 
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
+async function statusLine() {
+  const cfg = loadConfig();
+  const { raw, json: input } = readStdin();
 
-const C = {
-  reset: "\x1b[0m",
-  bold: "\x1b[1m",
-  dim: "\x1b[2m",
-  red: "\x1b[31m",
-  green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  cyan: "\x1b[36m",
-};
+  const prevOut = await runPreviousStatusLine(readJson(PREV_STATUSLINE_FILE, null), raw);
+  if (prevOut.trim()) process.stdout.write(prevOut.endsWith("\n") ? prevOut : prevOut + "\n");
 
-function projectsRoot() {
-  return join(homedir(), ".claude", "projects");
-}
+  const summary = readJson(SUMMARY_FILE, null);
+  if (summaryIsStale(summary, cfg)) spawnRefresh();
 
-function encodeProjectDir(cwd) {
-  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
-}
+  const S = palette(true);
+  const sep = `${S.dim} │ ${S.reset}`;
+  const model = shortModel(input.model?.id);
+  const ctx = typeof input.context_window?.used_percentage === "number" ? `ctx ${Math.round(input.context_window.used_percentage)}%` : null;
+  const rl = input.rate_limits;
+  const five = typeof rl?.five_hour?.used_percentage === "number" ? rl.five_hour.used_percentage : null;
+  const seven = typeof rl?.seven_day?.used_percentage === "number" ? rl.seven_day.used_percentage : null;
+  const subscription = five !== null || seven !== null;
 
-function findJsonl(dir) {
-  const out = [];
-  const mtimes = new Map();
-  const walk = (d) => {
-    let entries;
-    try {
-      entries = readdirSync(d);
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      const p = join(d, e);
-      let st;
-      try {
-        st = statSync(p);
-      } catch {
-        continue;
-      }
-      if (st.isDirectory()) walk(p);
-      else if (e.endsWith(".jsonl")) {
-        out.push(p);
-        mtimes.set(p, st.mtimeMs);
-      }
-    }
-  };
-  walk(dir);
-  return out.sort((a, b) => (mtimes.get(b) ?? 0) - (mtimes.get(a) ?? 0));
-}
-
-function openInBrowser(target) {
-  if (process.platform === "darwin") execFile("open", [target], () => {});
-  else if (process.platform === "win32") execFile("cmd", ["/c", "start", "", target], () => {});
-  else execFile("xdg-open", [target], () => {});
-}
-
-function latestSessionForCwd() {
-  const dir = join(projectsRoot(), encodeProjectDir(process.cwd()));
-  if (!existsSync(dir)) return undefined;
-  return findJsonl(dir)[0];
-}
-
-function profileFile(file) {
-  return profileSession(parseClaudeCodeLog(file));
-}
-
-function printSummary(p) {
-  const t = p.trajectory;
-  const wastePct = (p.wasteRatio * 100).toFixed(1);
-  console.log("");
-  console.log(
-    `${C.bold}agentprof${C.reset} ${C.dim}·${C.reset} ${t.sessionId.slice(0, 8)} ${C.dim}${t.cwd ?? ""}${C.reset}`,
-  );
-  if (t.firstUserMessage) console.log(`${C.dim}“${t.firstUserMessage.slice(0, 100)}”${C.reset}`);
-  console.log("");
-  console.log(
-    `  Total cost      ${C.bold}${usd(p.totalCost.total)}${C.reset}  ${C.dim}(${p.stepCosts.length} requests, cache-aware list price)${C.reset}`,
-  );
-  console.log(
-    `  Estimated waste ${C.red}${C.bold}${usd(p.wastedCost)}${C.reset}  ${C.red}${wastePct}% of total${C.reset}`,
-  );
-  const byKind = {};
-  for (const f of p.findings) byKind[f.kind] = (byKind[f.kind] ?? 0) + f.wastedCost;
-  const kinds = [
-    ["reread", "rereads", C.yellow],
-    ["duplicate-call", "duplicate calls", C.cyan],
-    ["retry", "retry tax", C.red],
-  ];
-  for (const [k, label, color] of kinds) {
-    if (byKind[k]) console.log(`    ${color}▸${C.reset} ${label.padEnd(16)} ${usd(byKind[k])}`);
-  }
-  console.log("");
-  const top = p.findings.slice(0, 5);
-  if (top.length) {
-    console.log(`  ${C.bold}Top leaks${C.reset}`);
-    for (const f of top) {
-      const tag = f.kind === "reread" ? "reread" : f.kind === "retry" ? "retry" : "dup";
-      console.log(
-        `    ${C.dim}${tag.padEnd(7)}${C.reset}${f.label.slice(0, 70).padEnd(72)} ${f.occurrences}× ${C.bold}${usd(f.wastedCost)}${C.reset}`,
-      );
-    }
-  }
-  if (p.unknownModels.length) {
-    console.log(
-      `\n  ${C.yellow}⚠ unknown model pricing (counted as $0): ${p.unknownModels.join(", ")}${C.reset}`,
-    );
-  }
-}
-
-function printTable(profiles, top) {
-  const rows = profiles
-    .filter((p) => p.totalCost.total > 0)
-    .sort((a, b) => b.wastedCost - a.wastedCost)
-    .slice(0, top);
-  const total = profiles.reduce((n, p) => n + p.totalCost.total, 0);
-  const waste = profiles.reduce((n, p) => n + p.wastedCost, 0);
-  console.log("");
-  console.log(
-    `${C.bold}agentprof${C.reset} — ${profiles.length} sessions · total ${C.bold}${usd(total)}${C.reset} · estimated waste ${C.red}${C.bold}${usd(waste)} (${total ? ((waste / total) * 100).toFixed(1) : 0}%)${C.reset}`,
-  );
-  console.log("");
-  console.log(
-    `  ${"session".padEnd(10)}${"cost".padStart(9)}${"waste".padStart(9)}${"%".padStart(7)}  ${"steps".padStart(5)}  first prompt`,
-  );
-  for (const p of rows) {
-    const t = p.trajectory;
-    const pctS = (p.wasteRatio * 100).toFixed(0) + "%";
-    console.log(
-      `  ${t.sessionId.slice(0, 8).padEnd(10)}${usd(p.totalCost.total).padStart(9)}${C.red}${usd(p.wastedCost).padStart(9)}${pctS.padStart(7)}${C.reset}  ${String(p.stepCosts.length).padStart(5)}  ${C.dim}${(t.firstUserMessage ?? "").slice(0, 48)}${C.reset}`,
-    );
-  }
-  console.log(
-    `\n  ${C.dim}Run ${C.reset}agentprof <path-to-session.jsonl>${C.dim} for a full HTML report of one session.${C.reset}`,
-  );
-}
-
-function main() {
-  const args = process.argv.slice(2);
-  const flags = new Set(args.filter((a) => a.startsWith("-")));
-  const getOpt = (name) => {
-    const i = args.indexOf(name);
-    return i >= 0 && args[i + 1] && !args[i + 1].startsWith("--") ? args[i + 1] : undefined;
-  };
-  const VALUE_OPTS = new Set(["--out", "--top"]);
-  const positional = args.filter((a, i) => !a.startsWith("-") && !VALUE_OPTS.has(args[i - 1]));
-
-  if (flags.has("--version") || flags.has("-v")) {
-    console.log(`agentprof ${VERSION}`);
+  if (!validSummary(summary)) {
+    console.log([`${S.bold}◆ ${model}${S.reset}`, ctx, `${S.dim}agentprof: indexing…${S.reset}`].filter(Boolean).join(sep));
     return;
   }
 
-  if (flags.has("--help") || flags.has("-h")) {
-    console.log(`agentprof — profiler for AI agent sessions
+  const t = summary.windows.today;
+  const line1 = [`${S.bold}◆ ${model}${S.reset}`, ctx];
+  if (subscription) line1.push([five !== null ? `5h ${Math.round(five)}%` : null, seven !== null ? `7d ${Math.round(seven)}%` : null].filter(Boolean).join(" · "));
+  line1.push(`${subscription ? `${S.dim}≈ ${S.reset}` : ""}today ${usd(t.cost)} · 7d ${usd(summary.windows.d7.cost)} · 30d ${usd(summary.windows.d30.cost)}`);
+  console.log(line1.filter(Boolean).join(sep));
+
+  const ratio = t.wasteRatioTotal;
+  const tone = ratio >= 0.4 ? S.red : ratio >= 0.2 ? S.yellow : S.green;
+  const parts = topN(
+    WASTE_KINDS.map((k) => ({ k, cost: t.waste[k].cost })).filter((x) => x.cost > 0),
+    "cost",
+    3,
+  ).map((x) => `${WASTE[x.k].short} ${pct(t.cost > 0 ? x.cost / t.cost : 0)}`);
+  let head = `🗑 waste ${tone}${usd(t.wasteCost)}${S.reset} (${pct(ratio)}: confirmed ${pct(t.wasteRatioConfirmed)} + est ${pct(ratio - t.wasteRatioConfirmed)})`;
+  if (subscription && five !== null) head += ` ≈ 5h ${pct((ratio * five) / 100)}`;
+  // Hints are about THIS session (that is where /clear or an MCP change acts).
+  const hints = [];
+  const sess = input.session_id ? summary.sessions?.[input.session_id] : undefined;
+  if (sess && sess.requests >= cfg.stale_turns && sess.staleShare >= cfg.stale_hint_ratio) hints.push("/clear recommended");
+  if (sess && sess.unusedMcpTokens >= cfg.mcp_hint_tokens) hints.push("prune unused MCP");
+  if (summary.unknownModels.length) hints.push(`unpriced model: ${summary.unknownModels.map(shortModel).join(",")}`);
+  const line2 = [head, parts.length ? parts.join(" · ") : `${S.dim}no waste detected${S.reset}`];
+  if (hints.length) line2.push(`${S.yellow}${hints.join(" · ")}${S.reset}`);
+  console.log(line2.join(sep));
+}
+
+// ---------------------------------------------------------------------------
+// Report (plain text; the skill prints it verbatim).
+// ---------------------------------------------------------------------------
+
+function table(headers, rows, aligns) {
+  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => String(r[i]).length)));
+  const fmt = (cells) => cells.map((v, i) => (aligns[i] === "r" ? String(v).padStart(widths[i]) : String(v).padEnd(widths[i]))).join("  ");
+  return [fmt(headers), widths.map((w) => "-".repeat(w)).join("  "), ...rows.map(fmt)].map((l) => "  " + l).join("\n");
+}
+
+function report(summary, top) {
+  const W = summary.windows;
+  const out = [];
+  out.push(`${C.bold}agentprof ${VERSION}${C.reset} — usage & waste  ${C.dim}(refreshed ${summary.generatedAt.replace("T", " ").slice(0, 19)}, prices as of ${summary.pricingRevised}, ${summary.files ?? 0} transcripts)${C.reset}`);
+  if (!summary.files) out.push(`${C.yellow}⚠ No transcripts found under ${PROJECTS_ROOT} in the last ${DEFAULT_CONFIG.window_days} days.${C.reset}`);
+  out.push("");
+  out.push(
+    table(
+      ["window", "cost", "requests", "confirmed", "estimated", "waste %", "cache expiry", "sessions"],
+      [
+        ["today", W.today],
+        ["7d", W.d7],
+        ["30d", W.d30],
+      ].map(([n, w]) => [n, usd(w.cost), w.requests, usd(w.confirmedCost), usd(w.estimatedCost), `${pct(w.wasteRatioTotal, 1)} (${pct(w.wasteRatioConfirmed, 1)} confirmed)`, usd(w.expiryCost), w.sessions]),
+      ["l", "r", "r", "r", "r", "r", "r", "r"],
+    ),
+  );
+  out.push("");
+  out.push(`${C.bold}Tokens (30d)${C.reset}  input ${compact(W.d30.tokens.input)} · output ${compact(W.d30.tokens.output)} · cache read ${compact(W.d30.tokens.cacheRead)} · cache write ${compact(W.d30.tokens.cacheWrite)}`);
+  out.push("");
+  out.push(`${C.bold}Waste by kind${C.reset}`);
+  out.push(
+    table(
+      ["id", "kind", "status", "today", "7d", "30d", "30d tokens", "share of 30d cost"],
+      WASTE_KINDS.map((k) => [k, WASTE[k].label, WASTE[k].confirmed ? "confirmed" : "estimated", usd(W.today.waste[k].cost), usd(W.d7.waste[k].cost), usd(W.d30.waste[k].cost), compact(W.d30.waste[k].tokens), pct(W.d30.cost > 0 ? W.d30.waste[k].cost / W.d30.cost : 0, 1)]),
+      ["l", "l", "l", "r", "r", "r", "r", "r"],
+    ),
+  );
+  out.push("");
+  out.push(`${C.dim}Not counted as waste: natural cache expiry (TTL elapsed between requests) — 30d ${usd(W.d30.expiryCost)}. Cache misses inside the TTL: ${W.d30.misses}; failed tool calls: ${W.d30.errors}. "tokens" = context tokens flagged once (W3: at the moment they went stale; W6: per fresh context).${C.reset}`);
+  out.push("");
+  if (W.d30.projects.length) {
+    out.push(`${C.bold}Projects (30d)${C.reset}`);
+    out.push(table(["project", "cost", "waste", "waste %"], W.d30.projects.slice(0, top).map((p) => [truncate(p.project, 60), usd(p.cost), usd(p.wasteCost), pct(p.cost > 0 ? p.wasteCost / p.cost : 0, 1)]), ["l", "r", "r", "r"]));
+    out.push("");
+  }
+  if (W.d30.topSessions.length) {
+    out.push(`${C.bold}Most expensive sessions (30d)${C.reset}`);
+    out.push(table(["session", "last active", "model", "cost", "waste"], W.d30.topSessions.slice(0, top).map((s) => [s.sessionId.slice(0, 8), (s.endTime ?? "").slice(0, 10), s.models.map(shortModel).join(","), usd(s.cost), usd(s.wasteCost)]), ["l", "l", "l", "r", "r"]));
+    out.push("");
+  }
+  if (W.d30.topRereads.length) {
+    out.push(`${C.bold}Top duplicate reads (30d)${C.reset}`);
+    out.push(table(["what", "times", "cost"], W.d30.topRereads.slice(0, top).map((r) => [truncate(r.label, 70), r.count, usd(r.cost)]), ["l", "r", "r"]));
+    out.push("");
+  }
+  if (W.d30.unusedMcp.length) {
+    out.push(`${C.bold}MCP tools defined but never called (30d)${C.reset}  ${C.dim}~${compact(W.d30.unusedMcpTokens)} tokens carried in every request${C.reset}`);
+    out.push(table(["tool", "tokens", "sessions"], W.d30.unusedMcp.slice(0, top).map((r) => [truncate(r.label, 60), compact(r.tokens), r.chains]), ["l", "r", "r"]));
+    out.push("");
+  }
+  if (W.d30.bigOutputs.length) {
+    out.push(`${C.bold}Largest tool outputs (30d)${C.reset}`);
+    out.push(table(["call", "tokens", "cost of excess"], W.d30.bigOutputs.slice(0, top).map((r) => [truncate(r.label, 70), compact(r.tokens), usd(r.cost)]), ["l", "r", "r"]));
+    out.push("");
+  }
+  if (summary.unknownModels.length) out.push(`${C.yellow}⚠ unknown model pricing (not converted to $): ${summary.unknownModels.join(", ")} — add them to ~/.claude/agentprof/pricing.json${C.reset}`);
+  if (summary.failedFiles) out.push(`${C.yellow}⚠ ${summary.failedFiles} transcript(s) could not be parsed (see state/index.json).${C.reset}`);
+  const names = (kinds) => kinds.map((k) => WASTE[k].label).join(" + ");
+  out.push(`${C.dim}Confirmed = ${names(CONFIRMED_KINDS)}. Estimated = ${names(ESTIMATED_KINDS)}. Tokens for tool results/text are ~chars/4; images ~${IMAGE_TOKENS} each.${C.reset}`);
+  return out.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// on / off: install the engine user-wide and wire the status line.
+// ---------------------------------------------------------------------------
+
+function loadSettings() {
+  if (!existsSync(SETTINGS_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(SETTINGS_FILE, "utf8"));
+  } catch {
+    throw new Error(`${SETTINGS_FILE} is not valid JSON — fix it first, nothing was changed`);
+  }
+}
+
+function saveSettings(settings, { backup = false } = {}) {
+  mkdirSync(DATA_DIR, { recursive: true });
+  // One backup of the user's original settings, taken the first time `on` changes them.
+  if (backup && existsSync(SETTINGS_FILE)) copyFileSync(SETTINGS_FILE, SETTINGS_BACKUP_FILE);
+  writeJsonAtomic(SETTINGS_FILE, settings);
+}
+
+/** The status line command. Prefer `node` from PATH (survives nvm upgrades); fall back to this Node binary. */
+function ourCommand() {
+  const engine = INSTALLED_ENGINE;
+  if (process.platform === "win32") return `node "${engine}" status`;
+  return `node "${engine}" status 2>/dev/null || "${process.execPath}" "${engine}" status`;
+}
+
+const isOurStatusLine = (sl) => typeof sl?.command === "string" && sl.command.includes(`"${INSTALLED_ENGINE}" status`);
+
+function turnOn() {
+  mkdirSync(DATA_DIR, { recursive: true });
+  const self = fileURLToPath(import.meta.url);
+  if (resolve(self) !== resolve(INSTALLED_ENGINE)) copyFileSync(self, INSTALLED_ENGINE);
+  const settings = loadSettings();
+  const current = settings.statusLine;
+  const firstTime = !isOurStatusLine(current);
+  if (firstTime) writeJsonAtomic(PREV_STATUSLINE_FILE, { had: current !== undefined, value: current ?? null });
+  settings.statusLine = { type: "command", command: ourCommand(), padding: 0 };
+  saveSettings(settings, { backup: firstTime });
+  spawnRefresh();
+  const prev = readJson(PREV_STATUSLINE_FILE, null);
+  console.log(`${C.green}✓${C.reset} agentprof status line on${prev?.had ? " (your previous status line is kept and shown above ours)" : ""}.\n  Engine: ${INSTALLED_ENGINE}\n  Data:   ${DATA_DIR}\n  Indexing transcripts in the background; the status line updates on the next response.`);
+}
+
+function turnOff() {
+  const settings = loadSettings();
+  const prev = readJson(PREV_STATUSLINE_FILE, null);
+  if (isOurStatusLine(settings.statusLine)) {
+    if (prev?.had && prev.value) settings.statusLine = prev.value;
+    else delete settings.statusLine;
+    saveSettings(settings);
+  }
+  try {
+    unlinkSync(PREV_STATUSLINE_FILE);
+  } catch {}
+  console.log(`${C.green}✓${C.reset} agentprof status line off${prev?.had ? " (previous status line restored)" : ""}. Indexed data kept in ${DATA_DIR}; run \`off\` before deleting that folder.`);
+}
+
+// ---------------------------------------------------------------------------
+// CLI.
+// ---------------------------------------------------------------------------
+
+const HELP = `agentprof ${VERSION} — token-waste tracker for Claude Code
 
 Usage:
-  agentprof init               install the /agentprof skill into this project
-  agentprof                    profile the latest session of the current project
-  agentprof --project          summarize every session of the current project
-  agentprof <file.jsonl>       profile one session log (writes an HTML report)
-  agentprof <dir>              summarize every session in a directory
+  agentprof on              show usage + waste in the Claude Code status line
+  agentprof off             remove it (restores your previous status line)
+  agentprof report          usage, waste (W1–W7) and per-project breakdown: today / 7d / 30d
+  agentprof refresh         re-index transcripts now
+  agentprof init            install the /agentprof skill into the current project
 
 Options:
-  --out <file>   where to write the HTML report (default: ./agentprof-report.html)
-  --open         open the report in your browser
-  --json         print the profile as JSON instead
-  --top <n>      rows to show in summary tables (default 20)`);
-    return;
-  }
+  --json          print the summary as JSON (report)
+  --top <n>       rows per table (default 10)
+  --version, -v   print the version
 
-  if (positional[0] === "init") {
-    // This script lives inside the skill folder (scripts/agentprof.mjs), so the
-    // skill source is our parent directory. Copy it into the target project.
-    const source = join(dirname(fileURLToPath(import.meta.url)), "..");
-    if (!existsSync(join(source, "SKILL.md"))) {
-      console.error(`${C.red}could not locate SKILL.md next to this script${C.reset}`);
-      process.exitCode = 1;
+Data lives in ~/.claude/agentprof (config.json, pricing.json override, daily index).`;
+
+const VALUE_OPTS = new Set(["--top"]);
+
+async function main() {
+  const args = process.argv.slice(2);
+  const flags = new Set(args.filter((a) => a.startsWith("-")));
+  const opt = (name, fallback) => {
+    const i = args.indexOf(name);
+    return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
+  };
+  const cmd = args.find((a, i) => !a.startsWith("-") && !VALUE_OPTS.has(args[i - 1]));
+
+  if (flags.has("--version") || flags.has("-v")) return console.log(`agentprof ${VERSION}`);
+  if (flags.has("--help") || flags.has("-h") || !cmd) return console.log(HELP);
+
+  switch (cmd) {
+    case "status":
+      return statusLine();
+    case "on":
+      return turnOn();
+    case "off":
+      return turnOff();
+    case "refresh": {
+      const s = refresh({ quiet: flags.has("--quiet") });
+      if (!flags.has("--quiet") && s) console.log(`${C.green}✓${C.reset} indexed ${s.parsedNow} changed transcript(s); 30d cost ${usd(s.windows.d30.cost)}, waste ${usd(s.windows.d30.wasteCost)}`);
       return;
     }
-    const dir = resolve(".claude", "skills", "agentprof");
-    mkdirSync(dir, { recursive: true });
-    cpSync(source, dir, { recursive: true });
-    console.log(
-      `${C.green}✓${C.reset} installed skill (with bundled engine) → ${dir}\n` +
-        `  In Claude Code, run ${C.bold}/agentprof usage${C.reset} or ${C.bold}/agentprof waste${C.reset}.\n` +
-        `  Commit the folder to share it with your team.`,
-    );
-    return;
-  }
-
-  let targets = [];
-  let aggregate = false;
-  if (flags.has("--project")) {
-    aggregate = true;
-    const dir = join(projectsRoot(), encodeProjectDir(process.cwd()));
-    if (!existsSync(dir)) {
-      console.error(`${C.yellow}No session logs found for this project.${C.reset}\nLooked in ${dir}`);
-      process.exitCode = 1;
-      return;
-    }
-    targets = findJsonl(dir);
-  } else if (positional.length > 0) {
-    for (const arg of positional) {
-      const p = resolve(arg);
-      if (!existsSync(p)) {
-        console.error(`${C.red}not found:${C.reset} ${p}`);
+    case "report": {
+      const cfg = loadConfig();
+      let summary = readJson(SUMMARY_FILE, null);
+      if (summaryIsStale(summary, cfg)) {
+        summary = refresh({ quiet: true }) ?? summary;
+        // Another process is indexing: wait for it rather than reporting stale/empty data.
+        for (let waited = 0; !validSummary(summary) && waited < 20_000 && lockIsFresh(); waited += 250) {
+          sleepMs(250);
+          summary = readJson(SUMMARY_FILE, null);
+        }
+        if (!validSummary(summary)) summary = refresh({ quiet: true }) ?? summary;
+      }
+      if (!validSummary(summary)) {
+        console.error(`${C.yellow}Indexing is still in progress — run \`agentprof report\` again in a few seconds.${C.reset}`);
         process.exitCode = 1;
         return;
       }
-      if (statSync(p).isDirectory()) {
-        aggregate = true;
-        targets.push(...findJsonl(p));
-      } else targets.push(p);
+      if (flags.has("--json")) return console.log(JSON.stringify(summary, null, 2));
+      return console.log(report(summary, Number(opt("--top", 10)) || 10));
     }
-  } else {
-    const latest = latestSessionForCwd();
-    if (!latest) {
-      console.error(
-        `${C.yellow}No session logs found for this project.${C.reset}\n` +
-          `Looked in ${join(projectsRoot(), encodeProjectDir(process.cwd()))}\n` +
-          `Try: agentprof <path-to-session.jsonl>`,
-      );
-      process.exitCode = 1;
-      return;
-    }
-    targets = [latest];
-  }
-
-  if (targets.length === 0) {
-    console.error(`${C.yellow}No .jsonl session logs found.${C.reset}`);
-    process.exitCode = 1;
-    return;
-  }
-
-  if (targets.length === 1 && !aggregate) {
-    const profile = profileFile(targets[0]);
-    if (flags.has("--json")) {
-      console.log(
-        JSON.stringify(
-          {
-            sessionId: profile.trajectory.sessionId,
-            totalCost: profile.totalCost,
-            wastedCost: profile.wastedCost,
-            wasteRatio: profile.wasteRatio,
-            findings: profile.findings,
-            toolStats: profile.toolStats,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    printSummary(profile);
-    const out = resolve(getOpt("--out") ?? "agentprof-report.html");
-    writeFileSync(out, renderReport(profile));
-    console.log(`\n  ${C.green}⤷ report:${C.reset} ${out}\n`);
-    if (flags.has("--open")) openInBrowser(out);
-  } else {
-    const profiles = [];
-    for (const f of targets) {
-      try {
-        profiles.push(profileFile(f));
-      } catch {
-        // unreadable/foreign log — skip
+    case "init": {
+      const source = join(dirname(fileURLToPath(import.meta.url)), "..");
+      if (!existsSync(join(source, "SKILL.md"))) {
+        console.error(`${C.red}could not locate SKILL.md next to this script${C.reset} — run init from the repo or via npx, not from ${INSTALLED_ENGINE}`);
+        process.exitCode = 1;
+        return;
       }
-    }
-    if (flags.has("--json")) {
-      const totalCost = profiles.reduce((n, p) => n + p.totalCost.total, 0);
-      const wastedCost = profiles.reduce((n, p) => n + p.wastedCost, 0);
-      console.log(
-        JSON.stringify(
-          {
-            sessions: profiles.length,
-            totalCost,
-            wastedCost,
-            wasteRatio: totalCost > 0 ? wastedCost / totalCost : 0,
-            perSession: profiles.map((p) => ({
-              sessionId: p.trajectory.sessionId,
-              file: p.trajectory.filePath,
-              firstUserMessage: p.trajectory.firstUserMessage,
-              steps: p.stepCosts.length,
-              totalCost: p.totalCost.total,
-              wastedCost: p.wastedCost,
-              wasteRatio: p.wasteRatio,
-              topFindings: p.findings.slice(0, 3),
-            })),
-          },
-          null,
-          2,
-        ),
-      );
+      const dir = resolve(".claude", "skills", "agentprof");
+      if (resolve(source) === dir) {
+        console.log(`${C.green}✓${C.reset} skill already installed at ${dir}`);
+        return;
+      }
+      mkdirSync(dir, { recursive: true });
+      cpSync(source, dir, { recursive: true });
+      console.log(`${C.green}✓${C.reset} installed skill → ${dir}\n  In Claude Code: ${C.bold}/agentprof on${C.reset} (status line), ${C.bold}/agentprof report${C.reset} (details).\n  Commit the folder to share it with your team.`);
       return;
     }
-    printTable(profiles, Number(getOpt("--top") ?? 20));
+    default:
+      console.error(`unknown command: ${cmd}\n\n${HELP}`);
+      process.exitCode = 1;
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(`${C.red}agentprof:${C.reset} ${err.message}`);
+  process.exitCode = 1;
+});

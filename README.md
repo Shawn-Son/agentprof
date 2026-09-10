@@ -1,12 +1,19 @@
 # agentprof
 
-**A profiler for AI agent sessions. See where your money went — and how much of it was waste.**
+**Token-waste tracker for Claude Code. Usage and waste in your status line — today, 7 days, 30 days.**
 
-Coding agents like Claude Code burn tokens in ways no dashboard shows you: the same file read twice, a failed command retried five times, a context window that snowballs until every single request re-pays for 800K tokens of history. Cost trackers tell you *how much* you spent. `agentprof` tells you *where it leaked*.
+Cost trackers tell you *how much* you spent. `agentprof` tells you *where it leaked*: context that went stale and got re-sent on every request, files read twice, tool output nobody needed, MCP tool definitions you never called, cache misses. Every number is priced in dollars, split into **confirmed** and **estimated**, and rolled up per day.
+
+```
+◆ Opus 5 │ ctx 41% │ 5h 34% · 7d 12% │ ≈ today $2.14 · 7d $18.3 · 30d $71.0
+🗑 waste $0.81 (38%: confirmed 24% + est 14%) ≈ 5h 11% │ stale 22% · tool-out 9% · MCP 7% │ /clear recommended
+```
+
+Subscription users see their 5h/7d limit percentages as the main indicator and the API-equivalent dollars as a reference. API-key users see dollars.
 
 ## Install
 
-From your project root (any project where you use Claude Code), run **one** of these — both produce the identical skill folder:
+From any project where you use Claude Code, run **one** of these:
 
 ```bash
 # with npm
@@ -18,112 +25,78 @@ npx -y agentprof init
 mkdir -p .claude/skills/agentprof/scripts && curl -fsSL https://raw.githubusercontent.com/Shawn-Son/agentprof/main/skills/agentprof/SKILL.md -o .claude/skills/agentprof/SKILL.md && curl -fsSL https://raw.githubusercontent.com/Shawn-Son/agentprof/main/skills/agentprof/scripts/agentprof.mjs -o .claude/skills/agentprof/scripts/agentprof.mjs
 ```
 
-The skill is **fully self-contained** — the entire profiler engine (one zero-dependency 45KB script) ships inside the skill folder, so there is nothing else to install and nothing runs over the network. Requirements: Node 18+ (which Claude Code already needs).
+The skill is **fully self-contained**: the whole engine is one zero-dependency Node script inside the skill folder. Nothing else to install, nothing runs over the network. Requirements: Node 18+ (which Claude Code already needs).
 
 Then, inside Claude Code:
 
 ```
-/agentprof usage     # how much has this project cost, per session
-/agentprof waste     # where money leaked, with dollar amounts and fixes
-/agentprof report    # full HTML report for the latest session
+/agentprof on        # usage + waste in the status line (two lines, updates after every response)
+/agentprof off       # remove it; your previous status line is restored
+/agentprof report    # full breakdown: W1–W7, projects, sessions, top leaks
 ```
 
-Claude profiles **this project's** sessions — never the whole machine — and answers with headline numbers first.
+`on` copies the engine to `~/.claude/agentprof/` so the status line keeps working in every project. If you already had a status line (ccusage, ccstatusline, your own script), it is kept and shown above agentprof's lines.
 
-**Share it with your team** by committing the folder — everyone who clones the project gets `/agentprof` automatically:
+Prefer the terminal? The same commands work directly:
 
 ```bash
-git add .claude/skills/agentprof && git commit -m "Add agentprof skill"
+node .claude/skills/agentprof/scripts/agentprof.mjs report
 ```
 
-## Update
+## What is counted as waste
 
-The skill never updates itself (no auto-update, no network calls). To update, **re-run the same install command you used above** — it overwrites the skill folder in place with the latest version. Your project code is untouched.
+| ID | Kind | Rule | Status |
+|---|---|---|---|
+| W1 | Cache miss | The cached prefix broke *inside* the cache TTL and had to be rewritten (e.g. CLAUDE.md edited or an MCP server toggled mid-session). Counted as the write-minus-read premium, same model only (a deliberate `/model` switch is not a miss). Natural TTL expiry is **not** waste and is reported separately. | confirmed |
+| W2 | Duplicate read | The same file range `Read` again with no edit in between (different `offset`/`limit` ranges are not duplicates); identical read-only calls (Grep/Glob/WebFetch…) repeated verbatim. | confirmed |
+| W3 | Stale context | Tool results not referenced again for 20 requests, yet re-sent (as cache reads) with every later request until compaction. | estimated |
+| W4 | Tool output | The part of a single tool result above 4,000 tokens. | estimated |
+| W5 | Filler text | Greetings, progress narration, closing summaries and offers in the assistant's prose. | estimated |
+| W6 | Unused MCP tools | MCP tool definitions sent with every request but never called in the session. Deferred tools (loaded on demand) cost nothing and are not counted. | confirmed |
+| W7 | Retry tax | Failed tool calls: the error output that entered context plus the output tokens spent emitting the call. | confirmed |
 
-```bash
-npx -y agentprof@latest init      # npm path
+Each context token belongs to exactly **one** kind (precedence: retry > duplicate > tool output > useful; stale applies to the useful part only), so the kinds never overlap and their sum cannot exceed what you actually paid. Costs are booked on the day of the request that paid them. Waste ratio is **cost-based**: `waste $ / total $`. Confirmed and estimated are always shown separately. Thresholds live in `~/.claude/agentprof/config.json` (`stale_turns`, `tool_output_threshold`, `window_days`, `refresh_seconds`).
+
+## How it works (and why it doesn't slow Claude Code down)
+
+- **No hooks.** Nothing runs in the tool-call path and nothing is injected into the model context. Zero extra tokens per turn.
+- **The status line only reads one cached JSON file** (`~/.claude/agentprof/summary.json`). It never parses transcripts. About 25 ms per call.
+- **Indexing runs in a detached background process**, at most once every 15 seconds, and only re-parses transcript files whose size or mtime changed. A full first index of 30 days (hundreds of MB) takes a second or two; after that it is milliseconds.
+- **Pricing is cache-aware**: input, output, cache writes at 1.25× (5-minute TTL) or 2× (1-hour TTL), cache reads at 0.1×. The TTL is read from each request, since Claude Code uses 1h for subscription sessions and 5m for API-key, subagent and compaction requests. Duplicate log lines per request are deduplicated.
+
+Data layout:
+
 ```
-
-…or re-run the curl command from Install. Check which version you have:
-
-```bash
-node .claude/skills/agentprof/scripts/agentprof.mjs --version
+~/.claude/agentprof/
+├── agentprof.mjs          # engine copy used by the status line
+├── summary.json           # today / 7d / 30d rollups (what the status line reads)
+├── sessions/<chain>.json  # one record per transcript, with per-day buckets
+├── state/index.json       # file → size/mtime, for incremental refresh
+├── config.json            # optional thresholds
+└── pricing.json           # optional price overrides: { "model-id": { "input": 5, "output": 25 } }
 ```
-
-On a team, one person updates and commits the folder; everyone else gets it on `git pull`. To uninstall, delete `.claude/skills/agentprof/`.
-
-Prefer the terminal?
-
-```bash
-npx agentprof --project  # every session of the current project
-npx agentprof            # just the latest session (+ HTML report)
-```
-
-No account. No API key. No instrumentation. It reads the session logs already sitting on your disk (`~/.claude/projects/**/*.jsonl`), scoped to your project, and produces a terminal summary plus a self-contained HTML report. Nothing leaves your machine.
-
-## What you get
-
-- **Cache-aware cost attribution** — every request priced with real list prices: input, output, cache writes (1.25×/2×), cache reads (0.1×). Duplicate log lines per request are deduped so nothing double-counts.
-- **Context Snowball chart** — tokens carried into each request over the session, with compaction cliffs visible. This is usually where the money actually goes.
-- **Waste detection** with dollars attached:
-  - **Rereads** — the same file read again with no edit in between. Re-reads after the file changed are *not* counted.
-  - **Duplicate calls** — identical read-only tool calls (Grep/Glob/WebFetch/…) repeated verbatim. Stateful tools like Bash are deliberately excluded.
-  - **Retry Tax** — failed tool calls: the error output that entered context, plus the output tokens spent emitting the doomed call.
 
 ## Honesty policy
 
-Every waste dollar is an **estimate with a published formula**, and the detectors are deliberately conservative:
-
-```
-waste($) = tokens × input_price × (1.25 cache-write + 0.1 × each later request that re-reads them)
-```
-
-Text tokens are estimated at 4 chars/token; images at a flat ~1,600 visual tokens (their base64 length is *not* counted — that would overstate waste 10–100×). Unknown models are surfaced, not silently priced at zero. If we can't defend a number, we don't show it.
-
-## Usage
-
-```bash
-agentprof init                     # install the /agentprof skill into this project
-agentprof --project                # every session of the current project
-agentprof                          # latest session of the current project
-agentprof path/to/session.jsonl    # one session → HTML report
-agentprof --json                   # machine-readable output
-agentprof --open                   # open the HTML report in your browser
-```
-
-## The skill (recommended)
-
-`agentprof init` drops the whole skill — instructions **and** the bundled engine — into `.claude/skills/agentprof/`:
-
-```
-.claude/skills/agentprof/
-├── SKILL.md               # when to trigger + how Claude interprets results
-└── scripts/agentprof.mjs  # the entire profiler, one zero-dependency script
-```
-
-From then on anyone on the project can run `/agentprof usage` or `/agentprof waste` (or just ask *"how much has this project cost?"*) — Claude runs the bundled engine (project-scoped, `node`-only, offline), reads the JSON, and answers with the headline numbers, the top leaks, and what to do about them. Commit the folder so your whole team gets it.
-
-To install it user-wide instead (works in every project): `mkdir -p ~/.claude/skills && cp -r skills/agentprof ~/.claude/skills/`
+Estimated waste depends on thresholds and on ~4 chars/token (images ~1,600 tokens each). Confirmed waste is measured directly from the logs. Prices carry a revision date and can be overridden; unknown model ids are listed, never silently priced at $0. If we can't defend a number, we label it estimated or don't show it.
 
 ## Roadmap
 
 `agentprof` is layer one of a three-layer plan:
 
-1. **Profile** *(this repo, today)* — measure trajectories, attribute cost, name the waste.
-2. **Optimize** — compiler-style passes: dedup caching, context pruning, step routing to smaller models, workflow distillation.
-3. **Verify** — every optimization must pass an outcome-equivalence gate: *cost −X%, quality Δ0*, or it auto-reverts. Savings claims without quality proof are marketing; ours ship with receipts.
-
-Trajectory parsing is adapter-based (Claude Code today; Codex/Gemini CLI/OpenTelemetry GenAI traces welcome — the analyzers only see a neutral IR).
+1. **Profile** *(this repo, today)* — measure, price, and name the waste.
+2. **Optimize** — interventions (context pruning, MCP hygiene, output compression) with their savings measured against a baseline. The summary already reserves the schema.
+3. **Verify** — every optimization must pass an outcome-equivalence gate: *cost −X%, quality Δ0*, or it auto-reverts.
 
 ## What's in this repo
 
-The repo **is** the skill — nothing else:
+The repo **is** the skill:
 
 ```
 skills/agentprof/
-├── SKILL.md               # the prompt: triggers, subcommands, interpretation rules
+├── SKILL.md               # the prompt: subcommands, interpretation rules, advice
 └── scripts/agentprof.mjs  # the engine: one readable zero-dependency file (source = executable)
-package.json               # only so `npx agentprof init` works; no dependencies, no build step
+package.json               # only so `npx agentprof init` works
 ```
 
-There is no build system: `agentprof.mjs` is plain Node — what you read is what runs. To contribute, edit that one file and test with `node skills/agentprof/scripts/agentprof.mjs --project`. MIT license.
+No build system. To contribute, edit that one file and test with `node skills/agentprof/scripts/agentprof.mjs report`. MIT license.
