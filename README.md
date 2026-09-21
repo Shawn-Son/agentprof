@@ -13,15 +13,9 @@ Subscription users see their 5h/7d limit percentages as the main indicator and t
 
 ## Install
 
-From any project where you use Claude Code, run **one** of these:
+From any project where you use Claude Code, copy the two files straight from this repo:
 
 ```bash
-# with npm
-npx -y agentprof init
-```
-
-```bash
-# without npm — copy the two files straight from this repo
 mkdir -p .claude/skills/agentprof/scripts && curl -fsSL https://raw.githubusercontent.com/Shawn-Son/agentprof/main/skills/agentprof/SKILL.md -o .claude/skills/agentprof/SKILL.md && curl -fsSL https://raw.githubusercontent.com/Shawn-Son/agentprof/main/skills/agentprof/scripts/agentprof.mjs -o .claude/skills/agentprof/scripts/agentprof.mjs
 ```
 
@@ -96,7 +90,7 @@ The repo **is** the skill:
 skills/agentprof/
 ├── SKILL.md               # the prompt: subcommands, interpretation rules, advice
 └── scripts/agentprof.mjs  # the engine: one readable zero-dependency file (source = executable)
-package.json               # only so `npx agentprof init` works
+package.json               # metadata only; not published to npm yet
 ```
 
 No build system. To contribute, edit that one file and test with `node skills/agentprof/scripts/agentprof.mjs report`. MIT license.
