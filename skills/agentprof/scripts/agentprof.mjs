@@ -37,7 +37,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 
 // ---------------------------------------------------------------------------
 // Pricing. USD per million tokens, Anthropic list prices.
@@ -431,6 +431,10 @@ function emptyBucket() {
     errors: 0,
     rereads: {}, // label -> {count, cost}
     bigOutputs: [], // {label, tokens, cost}
+    // Habits (not waste): every successful Read, by file. "whole" = no offset/limit.
+    reads: {}, // path -> {count, whole, tokens, cost}   cost = what carrying it afterwards cost
+    readCalls: 0,
+    readWhole: 0,
   };
 }
 
@@ -448,7 +452,18 @@ function addBucket(into, from) {
   into.errors += from.errors ?? 0;
   for (const [label, e] of Object.entries(from.rereads ?? {})) tally(into.rereads, label, e.count, e.cost);
   into.bigOutputs.push(...(from.bigOutputs ?? []));
+  for (const [path, e] of Object.entries(from.reads ?? {})) tallyRead(into.reads, path, e);
+  into.readCalls += from.readCalls ?? 0;
+  into.readWhole += from.readWhole ?? 0;
   return into;
+}
+
+function tallyRead(map, path, { count = 0, whole = 0, tokens = 0, cost = 0 }) {
+  const e = (map[path] ??= { count: 0, whole: 0, tokens: 0, cost: 0 });
+  e.count += count;
+  e.whole += whole;
+  e.tokens += tokens;
+  e.cost += cost;
 }
 
 function tally(map, label, count, cost) {
@@ -465,6 +480,7 @@ const topN = (items, key, n) => [...items].sort((a, b) => b[key] - a[key]).slice
 function trimBucket(b, n = PER_DAY_TOP) {
   b.rereads = Object.fromEntries(topN(Object.entries(b.rereads).map(([label, e]) => ({ label, ...e })), "cost", n).map((e) => [e.label, { count: e.count, cost: e.cost }]));
   b.bigOutputs = topN(b.bigOutputs, "cost", n);
+  b.reads = Object.fromEntries(topN(Object.entries(b.reads).map(([path, e]) => ({ path, ...e })), "cost", n).map(({ path, ...e }) => [path, e]));
   return b;
 }
 
@@ -534,6 +550,12 @@ function analyzeChain(chain, cfg) {
       if (c > 0) addWaste(kind, steps[j], 0, c);
     }
   };
+  /** Total cost of carrying T tokens produced at step i through the rest of its context (for report labels). */
+  const spanCost = (i, tokens) => {
+    let cost = 0;
+    for (let j = i + 1, end = ctxEnd[i]; j < end; j++) cost += tokens * carry(j, i + 1);
+    return cost;
+  };
 
   // ---- W1: cache miss vs natural expiry (same model, priced, non-empty requests) ----
   let prev = -1;
@@ -585,6 +607,12 @@ function analyzeChain(chain, cfg) {
           seenReads.set(key, i);
           duplicate = prevRead !== undefined && (lastModified.get(p) ?? -1) <= prevRead;
           label = p;
+          if (t > 0 && !call.result?.isError) {
+            const whole = call.input?.offset == null && call.input?.limit == null;
+            b.readCalls += 1;
+            if (whole) b.readWhole += 1;
+            tallyRead(b.reads, p, { count: 1, whole: whole ? 1 : 0, tokens: t, cost: spanCost(i, t) });
+          }
         }
       } else if (READONLY_TOOLS.has(call.name)) {
         const key = `${call.name}:${call.inputKey}`;
@@ -602,10 +630,7 @@ function analyzeChain(chain, cfg) {
         addWaste("W2", s, t, 0);
         chargeSpan("W2", i, t);
         // Attribute the whole span cost to this label for the report.
-        const end = ctxEnd[i];
-        let cost = 0;
-        for (let j = i + 1; j < end; j++) cost += t * carry(j, i + 1);
-        tally(b.rereads, label, 1, cost);
+        tally(b.rereads, label, 1, spanCost(i, t));
       } else if (t > 0) {
         let keep = t;
         if (t > cfg.tool_output_threshold) {
@@ -613,10 +638,7 @@ function analyzeChain(chain, cfg) {
           keep = cfg.tool_output_threshold;
           addWaste("W4", s, excess, 0);
           chargeSpan("W4", i, excess);
-          const end = ctxEnd[i];
-          let cost = 0;
-          for (let j = i + 1; j < end; j++) cost += excess * carry(j, i + 1);
-          b.bigOutputs.push({ label: `${call.name} ${summarizeInput(call)}`, tokens: t, cost });
+          b.bigOutputs.push({ label: `${call.name} ${summarizeInput(call)}`, tokens: t, cost: spanCost(i, excess) });
         }
         useful.push({ call, i, tokens: keep });
       }
@@ -708,6 +730,11 @@ function summarizeInput(call) {
 
 function truncate(s, n) {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+/** Keep the tail (file paths: the file name matters more than the prefix). */
+function truncateLeft(s, n) {
+  return s.length > n ? "…" + s.slice(s.length - n + 1) : s;
 }
 
 function chainKey(file) {
@@ -907,6 +934,9 @@ function buildSummary(cfg) {
       }
     }
     const rereads = Object.entries(total.rereads).map(([label, e]) => ({ label, ...e }));
+    const wholeReads = Object.entries(total.reads)
+      .filter(([, e]) => e.whole > 0)
+      .map(([label, e]) => ({ label, count: e.count, whole: e.whole, avgTokens: Math.round(e.tokens / e.count), cost: e.cost }));
     out.windows[name] = {
       from,
       to,
@@ -921,10 +951,16 @@ function buildSummary(cfg) {
       ...summarizeBucket(total),
       sessions: sessions.size,
       projects: topN(
-        [...projects.entries()].map(([project, b]) => ({ project, cost: b.cost, wasteCost: wasteCost(b) })),
+        [...projects.entries()].map(([project, b]) => {
+          const wc = wasteCost(b);
+          const topKind = topN(WASTE_KINDS.map((k) => ({ k, cost: b.waste[k].cost })).filter((x) => x.cost > 0), "cost", 1)[0];
+          return { project, cost: b.cost, wasteCost: wc, wasteRatio: b.cost > 0 ? wc / b.cost : 0, topKind: topKind?.k ?? null, topKindCost: topKind?.cost ?? 0 };
+        }),
         "cost",
         15,
       ),
+      readStats: { calls: total.readCalls, whole: total.readWhole, wholeShare: total.readCalls > 0 ? total.readWhole / total.readCalls : 0 },
+      topWholeReads: topN(wholeReads, "cost", 10),
       topSessions: topN(
         [...sessions.values()].map((s) => ({ sessionId: s.sessionId, project: s.project, models: [...s.models], endTime: s.endTime, cost: s.bucket.cost, wasteCost: wasteCost(s.bucket) })),
         "cost",
@@ -1132,7 +1168,19 @@ function report(summary, top) {
   out.push("");
   if (W.d30.projects.length) {
     out.push(`${C.bold}Projects (30d)${C.reset}`);
-    out.push(table(["project", "cost", "waste", "waste %"], W.d30.projects.slice(0, top).map((p) => [truncate(p.project, 60), usd(p.cost), usd(p.wasteCost), pct(p.cost > 0 ? p.wasteCost / p.cost : 0, 1)]), ["l", "r", "r", "r"]));
+    out.push(
+      table(
+        ["project", "cost", "waste", "waste %", "top leak"],
+        W.d30.projects.slice(0, top).map((p) => [truncate(p.project, 60), usd(p.cost), usd(p.wasteCost), pct(p.wasteRatio ?? 0, 1), p.topKind ? `${WASTE[p.topKind].short} ${pct(p.cost > 0 ? p.topKindCost / p.cost : 0, 1)}` : "-"]),
+        ["l", "r", "r", "r", "l"],
+      ),
+    );
+    out.push("");
+  }
+  if (W.d30.readStats?.calls) {
+    const rs = W.d30.readStats;
+    out.push(`${C.bold}Files you read whole (30d)${C.reset}  ${C.dim}${pct(rs.wholeShare)} of your ${rs.calls} Reads had no offset/limit. Not waste by itself — the cost is carrying the file in every later request.${C.reset}`);
+    if (W.d30.topWholeReads.length) out.push(table(["file", "times", "whole", "avg tokens", "carried cost"], W.d30.topWholeReads.slice(0, top).map((r) => [truncateLeft(r.label, 70), r.count, r.whole, compact(r.avgTokens), usd(r.cost)]), ["l", "r", "r", "r", "r"]));
     out.push("");
   }
   if (W.d30.topSessions.length) {

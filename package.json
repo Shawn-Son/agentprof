@@ -1,6 +1,6 @@
 {
   "name": "agentprof",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Claude Code skill that tracks your Claude Code token waste — usage and waste in the status line, today / 7d / 30d.",
   "keywords": [
     "claude-code",

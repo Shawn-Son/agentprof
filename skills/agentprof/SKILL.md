@@ -52,6 +52,19 @@ skill costs almost no tokens.
   main indicator.
 - Unknown model ids are listed, never priced at $0.
 
+## Habits (shown in the report, not counted as waste)
+
+- **Files you read whole**: how many `Read` calls had no `offset`/`limit`,
+  and which files were read whole most often with what it cost to *carry*
+  them in every later request. A whole read is often legitimate (editing
+  needs the exact text). The lever is timing, not avoidance: read right
+  before the file is needed, and `/clear` or delegate to a subagent once
+  it has served its purpose. A one-line rule in the project's CLAUDE.md
+  ("Grep first, then Read with offset/limit; whole-file exploration goes
+  to a subagent") fixes the habit for good.
+- **Projects table → top leak**: the waste kind that dominates each
+  project, so the advice below can be given per project.
+
 ## Actionable advice to pair with findings
 
 - **stale context** dominates → `/clear` (or a fresh session) after a task

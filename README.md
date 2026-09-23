@@ -49,6 +49,13 @@ node .claude/skills/agentprof/scripts/agentprof.mjs report
 | W6 | Unused MCP tools | MCP tool definitions sent with every request but never called in the session. Deferred tools (loaded on demand) cost nothing and are not counted. | confirmed |
 | W7 | Retry tax | Failed tool calls: the error output that entered context plus the output tokens spent emitting the call. | confirmed |
 
+### Habits (reported, not counted as waste)
+
+The harness can tell you how much you spent. It cannot tell you *which of your own habits* drive it. The report adds:
+
+- **Files you read whole** — the share of `Read` calls with no `offset`/`limit`, and the files you read whole most often with the cost of carrying each one in every later request. A whole read is often the right call (editing needs the exact text); the lever is *timing*: read right before you need it, and `/clear` or hand exploration to a subagent once it has served its purpose.
+- **Top leak per project** — the waste kind that dominates each project, so the fix can be project-specific (a `CLAUDE.md` rule, an MCP server to disable there).
+
 Each context token belongs to exactly **one** kind (precedence: retry > duplicate > tool output > useful; stale applies to the useful part only), so the kinds never overlap and their sum cannot exceed what you actually paid. Costs are booked on the day of the request that paid them. Waste ratio is **cost-based**: `waste $ / total $`. Confirmed and estimated are always shown separately. Thresholds live in `~/.claude/agentprof/config.json` (`stale_turns`, `tool_output_threshold`, `window_days`, `refresh_seconds`).
 
 ## How it works (and why it doesn't slow Claude Code down)
