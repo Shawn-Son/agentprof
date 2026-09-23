@@ -32,7 +32,8 @@ Every command below writes `<ENGINE>` for that path.
 | `/agentprof` (bare) or anything else | List the three subcommands in one line each, then run `report`. |
 
 Natural-language questions map to `report`: "how much did I spend this
-week?", "where did my tokens go?", "did the agent waste tokens?".
+week?", "where did my tokens go?", "did the agent waste tokens?", "why did
+I hit my limit yesterday?", "which files do I keep reading whole?".
 
 Never read or summarize the raw JSON (`--json`) unless the user asks for
 machine-readable output — the engine's text report exists so that this
@@ -70,6 +71,10 @@ skill costs almost no tokens.
   5h window drains in proportion to it. The status line shows the current
   session's average as `avg 185K/req`. Zero compactions is normal on 1M
   context models; a session with several compactions is one to split.
+- **Rate-limit hits**: every time the 5h/7d window actually ran out
+  (Claude Code logs the 429), with local time, project and session. Pair
+  it with the projects table: the project that was active at the hit is
+  where context size should be cut first.
 
 ## Actionable advice to pair with findings
 

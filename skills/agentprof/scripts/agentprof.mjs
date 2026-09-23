@@ -260,6 +260,7 @@ function parseChain(filePath) {
   const callsById = new Map();
   const usageSeen = new Set();
   const compactionsBeforeStep = new Set(); // step index at which a fresh context begins
+  const limitHits = []; // {at, text}: the subscription window ran out (HTTP 429, synthetic assistant line)
   let toolDefs; // last prompt_snapshot with tools: [{name, tokens}]
   let sessionId = basename(filePath).replace(/\.jsonl$/, "");
   let cwd;
@@ -294,6 +295,12 @@ function parseChain(filePath) {
     }
     if (o.isCompactSummary === true || (o.type === "system" && o.subtype === "compact_boundary")) {
       compactionsBeforeStep.add(steps.length);
+      continue;
+    }
+    if (o.apiErrorStatus === 429 || o.error === "rate_limit") {
+      // Not a real request (usage is all zeros, model "<synthetic>"): record it, don't count it.
+      const text = Array.isArray(o.message?.content) ? o.message.content.find((b) => typeof b?.text === "string")?.text ?? "" : "";
+      limitHits.push({ at: o.timestamp ?? "", text: text.slice(0, 120) });
       continue;
     }
 
@@ -359,6 +366,7 @@ function parseChain(filePath) {
     steps,
     toolDefs,
     compactionsBeforeStep,
+    limitHits,
   };
 }
 
@@ -438,6 +446,7 @@ function emptyBucket() {
     // Context pressure: prompt size (input + cache read + cache write) per request.
     ctx: { sum: 0, max: 0, n: 0, bins: [0, 0, 0, 0] }, // bins: <50K, 50–200K, 200–400K, >400K
     compactions: 0,
+    limitHits: 0, // times the subscription window ran out (HTTP 429)
   };
 }
 
@@ -468,6 +477,7 @@ function addBucket(into, from) {
     for (let i = 0; i < into.ctx.bins.length; i++) into.ctx.bins[i] += from.ctx.bins[i] ?? 0;
   }
   into.compactions += from.compactions ?? 0;
+  into.limitHits += from.limitHits ?? 0;
   return into;
 }
 
@@ -544,6 +554,7 @@ function analyzeChain(chain, cfg) {
   }
   // A compaction marker before step k is booked on the day of step k (or the last step).
   if (steps.length) for (const k of chain.compactionsBeforeStep) dayBucket(steps[Math.min(k, steps.length - 1)]).compactions += 1;
+  for (const h of chain.limitHits) (days[dayOf(h.at) ?? "unknown"] ??= emptyBucket()).limitHits += 1;
 
   const addWaste = (kind, step, tokens, cost) => {
     const b = dayBucket(step);
@@ -730,6 +741,7 @@ function analyzeChain(chain, cfg) {
     requests: steps.length,
     days,
     unusedMcp,
+    limitHits: chain.limitHits.slice(-20),
     unknownModels: [...unknownModels],
   };
 }
@@ -947,8 +959,20 @@ function buildSummary(cfg) {
     const projects = new Map();
     const sessions = new Map();
     const unusedMcp = new Map();
+    const limitHits = new Map(); // one event per session and minute (main chain + subagents all log the same 429)
     for (const r of records) {
       let touched = false;
+      for (const h of r.limitHits ?? []) {
+        const day = dayOf(h.at) ?? "";
+        if (day < from || day > to) continue;
+        const key = `${r.sessionId}|${String(h.at).slice(0, 16)}`;
+        const e = limitHits.get(key);
+        if (!e) limitHits.set(key, { at: h.at, project: r.project, sessionId: r.sessionId, text: h.text, lines: 1, sidechain: r.isSidechain });
+        else {
+          e.lines += 1;
+          if (e.sidechain && !r.isSidechain) Object.assign(e, { project: r.project, sidechain: false });
+        }
+      }
       for (const [day, b] of Object.entries(r.days)) {
         if (day < from || day > to) continue;
         touched = true;
@@ -998,6 +1022,7 @@ function buildSummary(cfg) {
       topWholeReads: topN(wholeReads, "cost", 10),
       context: summarizeCtx(total),
       compactions: total.compactions,
+      limitHits: { count: limitHits.size, recent: [...limitHits.values()].sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, 10).map(({ sidechain, ...e }) => e) },
       topSessions: topN(
         [...sessions.values()].map((s) => ({ sessionId: s.sessionId, project: s.project, models: [...s.models], endTime: s.endTime, cost: s.bucket.cost, wasteCost: wasteCost(s.bucket) })),
         "cost",
@@ -1071,6 +1096,14 @@ const compact = (n) => {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
   return String(Math.round(n));
 };
+
+/** "2026-09-02 14:05" in the local timezone. */
+function localTime(ts) {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return String(ts ?? "");
+  const p = (n) => String(n).padStart(2, "0");
+  return `${dayOf(d)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
 
 function shortModel(id) {
   if (!id) return "Claude";
@@ -1224,6 +1257,12 @@ function report(summary, top) {
         ["l", "r", "r", "r", "l"],
       ),
     );
+    out.push("");
+  }
+  if (W.d30.limitHits) {
+    const lh = W.d30.limitHits;
+    out.push(`${C.bold}Rate-limit hits (30d)${C.reset}  ${lh.count ? `${lh.count} time${lh.count > 1 ? "s" : ""} the subscription window ran out (today ${W.today.limitHits?.count ?? 0}, 7d ${W.d7.limitHits?.count ?? 0})` : `${C.dim}none — you never hit the 5h/7d window${C.reset}`}`);
+    if (lh.recent.length) out.push(table(["when (local)", "project", "session", "message"], lh.recent.slice(0, top).map((h) => [localTime(h.at), truncateLeft(h.project, 44), h.sessionId.slice(0, 8), truncate(h.text.replace(/\s*\(.*$/, ""), 44)]), ["l", "l", "l", "l"]));
     out.push("");
   }
   if (W.d30.readStats?.calls) {
