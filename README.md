@@ -5,11 +5,11 @@
 Cost trackers tell you *how much* you spent. `agentprof` tells you *where it leaked*: context that went stale and got re-sent on every request, files read twice, tool output nobody needed, MCP tool definitions you never called, cache misses. Every number is priced in dollars, split into **confirmed** and **estimated**, and rolled up per day.
 
 ```
-◆ Opus 5 │ ctx 41% · avg 185K/req │ 5h 34% · 7d 12% │ ≈ today $2.14 · 7d $18.3 · 30d $71.0
+◆ Opus 5 │ ctx 41% · avg 185K/req │ 5h 62% → ~3:40pm · 7d 12% │ ≈ today $2.14 · 7d $18.3 · 30d $71.0
 ◇ waste $0.81 (38%: confirmed 24% + est 14%) ≈ 5h 11% │ stale 22% · tool-out 9% · MCP 7% │ /clear recommended
 ```
 
-Subscription users see their 5h/7d limit percentages as the main indicator and the API-equivalent dollars as a reference. API-key users see dollars.
+Subscription users see their 5h/7d window as the main indicator: the percentage, and once a few responses have been sampled, **when the window runs out at the current burn rate** (`→ ~3:40pm`; no arrow means the reset comes first). Dollars are the API-equivalent reference. API-key users see dollars.
 
 ## Install
 
@@ -57,13 +57,14 @@ The harness can tell you how much you spent. It cannot tell you *which of your o
 - **Top leak per project** — the waste kind that dominates each project, so the fix can be project-specific (a `CLAUDE.md` rule, an MCP server to disable there).
 - **Context per request** — the average prompt size each request re-reads, its distribution (<50K / 50–200K / 200–400K / >400K), the peak, and the number of compactions. On a subscription this is the number that decides when you hit the 5h limit: every request re-reads its whole context as cache reads. The status line shows the current session's average (`avg 185K/req`). Zero compactions is normal on 1M-context models.
 - **Rate-limit hits** — every time your 5h/7d window actually ran out, with local time, project and session (Claude Code logs the 429 in the transcript). Together with the projects table this answers "why did I hit the limit yesterday?".
+- **Current window forecast** — for subscription users, the 5h/7d burn rate (%/hour, %/day) and the projected time the window runs out. Computed from the usage percentages Claude Code hands the status line after each response; a sample is appended to `state/limits.jsonl` only when the value changes, and samples older than 7 days are pruned on the next refresh.
 
 Each context token belongs to exactly **one** kind (precedence: retry > duplicate > tool output > useful; stale applies to the useful part only), so the kinds never overlap and their sum cannot exceed what you actually paid. Costs are booked on the day of the request that paid them. Waste ratio is **cost-based**: `waste $ / total $`. Confirmed and estimated are always shown separately. Thresholds live in `~/.claude/agentprof/config.json` (`stale_turns`, `tool_output_threshold`, `window_days`, `refresh_seconds`).
 
 ## How it works (and why it doesn't slow Claude Code down)
 
 - **No hooks.** Nothing runs in the tool-call path and nothing is injected into the model context. Zero extra tokens per turn.
-- **The status line only reads one cached JSON file** (`~/.claude/agentprof/summary.json`). It never parses transcripts. About 25 ms per call.
+- **The status line only reads one cached JSON file** (`~/.claude/agentprof/summary.json`) plus the tail of the small limits log. It never parses transcripts. About 25 ms per call.
 - **Indexing runs in a detached background process**, at most once every 15 seconds, and only re-parses transcript files whose size or mtime changed. A full first index of 30 days (hundreds of MB) takes a second or two; after that it is milliseconds.
 - **Pricing is cache-aware**: input, output, cache writes at 1.25× (5-minute TTL) or 2× (1-hour TTL), cache reads at 0.1×. The TTL is read from each request, since Claude Code uses 1h for subscription sessions and 5m for API-key, subagent and compaction requests. Duplicate log lines per request are deduplicated.
 
@@ -75,6 +76,7 @@ Data layout:
 ├── summary.json           # today / 7d / 30d rollups (what the status line reads)
 ├── sessions/<chain>.json  # one record per transcript, with per-day buckets
 ├── state/index.json       # file → size/mtime, for incremental refresh
+├── state/limits.jsonl     # 5h/7d usage samples (subscription only, 7 days, a few KB)
 ├── config.json            # optional thresholds
 └── pricing.json           # optional price overrides: { "model-id": { "input": 5, "output": 25 } }
 ```

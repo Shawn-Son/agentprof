@@ -39,6 +39,21 @@ Never read or summarize the raw JSON (`--json`) unless the user asks for
 machine-readable output — the engine's text report exists so that this
 skill costs almost no tokens.
 
+## For subscription users (Pro/Max) — read this first
+
+Most Claude Code users are on a subscription, and what they feel is not
+dollars but the **5h / 7d window**. Lead with these when explaining a report:
+
+- **5h / 7d %** and, once there are a few samples in the current window,
+  the **forecast** (`5h 62% → ~3:40pm`): at the current burn rate the
+  window runs out at that time, before it resets. No arrow means the
+  reset comes first. The report's "Current window" line shows the rate.
+- **Context per request** (`avg 185K/req`): every request re-reads its
+  whole context, so this number *is* the burn rate. Halving it roughly
+  doubles how long the window lasts.
+- **Rate-limit hits**: when it actually ran out, in which project.
+- Dollar figures are the API-equivalent value, shown as a reference.
+
 ## What the numbers mean
 
 - **Confirmed waste** (W1 cache miss, W2 duplicate read, W6 unused MCP
@@ -48,9 +63,6 @@ skill costs almost no tokens.
   4,000 tokens) and on ~4 chars/token. Always say "estimated" when quoting it.
 - **Cache expiry** is *not* waste: the cache TTL simply elapsed between
   requests. It is shown separately as an opportunity cost.
-- For subscription users the dollar figures are the API-equivalent value,
-  not a bill; the status line shows the 5h/7d limit percentages as the
-  main indicator.
 - Unknown model ids are listed, never priced at $0.
 
 ## Habits (shown in the report, not counted as waste)

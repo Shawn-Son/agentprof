@@ -19,6 +19,7 @@
 
 import { execFile, spawn } from "node:child_process";
 import {
+  appendFileSync,
   closeSync,
   copyFileSync,
   cpSync,
@@ -27,6 +28,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
   statSync,
@@ -107,6 +109,8 @@ const PREV_STATUSLINE_FILE = join(DATA_DIR, "prev-statusline.json");
 const SETTINGS_BACKUP_FILE = join(DATA_DIR, "settings.backup.json");
 const INSTALLED_ENGINE = join(DATA_DIR, "agentprof.mjs");
 const MODE_FILE = join(DATA_DIR, "mode.json"); // { subscription: true } once rate_limits was seen
+const LIMITS_FILE = join(STATE_DIR, "limits.jsonl"); // 5h/7d usage samples from the status line (subscription only)
+const LIMITS_KEEP_MS = 7 * 86_400_000;
 const SETTINGS_FILE = join(CLAUDE_DIR, "settings.json");
 const PROJECTS_ROOT = join(CLAUDE_DIR, "projects");
 
@@ -892,6 +896,7 @@ function refresh({ quiet = false } = {}) {
       }
     }
     writeJsonAtomic(INDEX_FILE, index);
+    pruneLimitSamples();
     const summary = buildSummary(cfg);
     summary.files = live.size;
     summary.failedFiles = Object.values(index.files).filter((f) => f.error).length;
@@ -1058,6 +1063,127 @@ function buildSummary(cfg) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Rate-limit samples (subscription only). Claude Code hands the status line
+// the 5h/7d usage percentages and their reset times on every response; we
+// keep a small append-only log of them to answer "at this pace, when do I
+// hit the limit?". Nothing here touches the transcripts.
+// ---------------------------------------------------------------------------
+
+/** The last ~64KB of the sample log, parsed. */
+function readLimitSamples(maxBytes = 65_536) {
+  let fd;
+  try {
+    fd = openSync(LIMITS_FILE, "r");
+  } catch {
+    return [];
+  }
+  try {
+    const size = statSync(LIMITS_FILE).size;
+    const start = Math.max(0, size - maxBytes);
+    const buf = Buffer.alloc(size - start);
+    readSync(fd, buf, 0, buf.length, start);
+    const lines = buf.toString("utf8").split("\n");
+    if (start > 0) lines.shift(); // partial first line
+    const out = [];
+    for (const l of lines) {
+      if (!l.trim()) continue;
+      try {
+        out.push(JSON.parse(l));
+      } catch {}
+    }
+    return out;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function appendLimitSample(sample) {
+  mkdirSync(STATE_DIR, { recursive: true });
+  appendFileSync(LIMITS_FILE, JSON.stringify(sample) + "\n");
+}
+
+/** Drop samples older than LIMITS_KEEP_MS (called by refresh; the status line never rewrites the file). */
+function pruneLimitSamples() {
+  let txt;
+  try {
+    txt = readFileSync(LIMITS_FILE, "utf8");
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - LIMITS_KEEP_MS;
+  const all = txt.split("\n").filter((l) => l.trim());
+  const keep = all.filter((l) => {
+    try {
+      return JSON.parse(l).t >= cutoff;
+    } catch {
+      return false;
+    }
+  });
+  if (keep.length !== all.length) writeFileSync(LIMITS_FILE, keep.length ? keep.join("\n") + "\n" : "");
+}
+
+/**
+ * Linear burn-rate forecast for one window ("five"/"fiveReset" or "seven"/"sevenReset").
+ * Uses only samples from the current window (same reset time) within `lookbackMs`.
+ * slope is %/hour; eta is null when it would fall after the reset (the window wins).
+ */
+function forecastLimit(samples, key, resetKey, lookbackMs, now = Date.now()) {
+  const cur = samples[samples.length - 1];
+  if (!cur || typeof cur[key] !== "number") return null;
+  const reset = typeof cur[resetKey] === "number" ? cur[resetKey] * 1000 : null;
+  const base = { pct: cur[key], sampledAt: cur.t, slope: null, eta: null, reset, points: 0 };
+  const pts = samples.filter((s) => typeof s[key] === "number" && s[resetKey] === cur[resetKey] && now - s.t <= lookbackMs);
+  base.points = pts.length;
+  if (pts.length < 3) return base;
+  const t0 = pts[0].t;
+  let sx = 0;
+  let sy = 0;
+  let sxx = 0;
+  let sxy = 0;
+  for (const p of pts) {
+    const x = (p.t - t0) / 3.6e6;
+    const y = p[key];
+    sx += x;
+    sy += y;
+    sxx += x * x;
+    sxy += x * y;
+  }
+  const n = pts.length;
+  const den = n * sxx - sx * sx;
+  if (den <= 0) return base;
+  const slope = (n * sxy - sx * sy) / den;
+  base.slope = slope;
+  if (!(slope > 0) || cur[key] >= 100) return base;
+  const eta = now + ((100 - cur[key]) / slope) * 3.6e6;
+  base.eta = reset !== null && eta >= reset ? null : eta;
+  return base;
+}
+
+/** Current 5h/7d picture for the report and --json; null when no samples exist (API-key users). */
+function limitsNow() {
+  const samples = readLimitSamples();
+  if (!samples.length) return null;
+  return {
+    samples: samples.length,
+    five: forecastLimit(samples, "five", "fiveReset", 60 * 60_000),
+    seven: forecastLimit(samples, "seven", "sevenReset", 24 * 3.6e6),
+  };
+}
+
+const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).toLowerCase().replace(/\s+/g, "");
+const dayClock = (ms) => `${new Date(ms).toLocaleDateString([], { weekday: "short" })} ${clock(ms)}`;
+
+/** "5h 62% → ~3:40pm" / "5h 62% · resets 5:50pm" / "7d 12% → ~Thu 3pm". */
+function limitText(label, f, { showReset = false, day = false } = {}) {
+  if (!f) return null;
+  const at = (ms) => (day ? dayClock(ms) : clock(ms));
+  let s = `${label} ${Math.round(f.pct)}%`;
+  if (f.eta) s += ` → ~${at(f.eta)}`;
+  else if (showReset && f.reset) s += ` · resets ${at(f.reset)}`;
+  return s;
+}
+
 /** A summary this engine version can render. */
 function validSummary(s) {
   return !!s && s.version === VERSION && !!s.windows?.today && !!s.windows?.d7 && !!s.windows?.d30 && Number.isFinite(Date.parse(s.generatedAt));
@@ -1162,8 +1288,31 @@ async function statusLine() {
   // rate_limits only exists for Pro/Max and only after the first API response;
   // remember it so a fresh session renders the subscription layout from the start.
   let subscription = five !== null || seven !== null;
+  let f5 = null;
+  let f7 = null;
   if (subscription) {
     if (!readJson(MODE_FILE, null)?.subscription) writeJsonAtomic(MODE_FILE, { subscription: true });
+    // Sample the window once per change (the status line runs after every response) and forecast from the log.
+    try {
+      const samples = readLimitSamples();
+      const last = samples[samples.length - 1];
+      const cu = input.context_window?.current_usage;
+      const sample = {
+        t: Date.now(),
+        sid: input.session_id ?? null,
+        five,
+        fiveReset: typeof rl?.five_hour?.resets_at === "number" ? rl.five_hour.resets_at : null,
+        seven,
+        sevenReset: typeof rl?.seven_day?.resets_at === "number" ? rl.seven_day.resets_at : null,
+        ctx: cu ? (cu.input_tokens ?? 0) + (cu.cache_read_input_tokens ?? 0) + (cu.cache_creation_input_tokens ?? 0) : null,
+      };
+      if (!last || last.five !== sample.five || last.seven !== sample.seven || last.fiveReset !== sample.fiveReset) {
+        appendLimitSample(sample);
+        samples.push(sample);
+      }
+      f5 = five !== null ? forecastLimit(samples, "five", "fiveReset", 60 * 60_000) : null;
+      f7 = seven !== null ? forecastLimit(samples, "seven", "sevenReset", 24 * 3.6e6) : null;
+    } catch {}
   } else subscription = readJson(MODE_FILE, null)?.subscription === true;
 
   if (!validSummary(summary)) {
@@ -1177,7 +1326,12 @@ async function statusLine() {
   const avgCtx = sess?.avgContext || t.context?.avg || 0;
   const ctxParts = [ctx, avgCtx ? `avg ${compact(avgCtx)}/req` : null, sess?.compactions ? `${sess.compactions} compaction${sess.compactions > 1 ? "s" : ""}` : null].filter(Boolean);
   const line1 = [`${S.bold}◆ ${model}${S.reset}`, ctxParts.length ? ctxParts.join(" · ") : null];
-  if (subscription) line1.push([five !== null ? `5h ${Math.round(five)}%` : null, seven !== null ? `7d ${Math.round(seven)}%` : null].filter(Boolean).join(" · "));
+  if (subscription) {
+    // Forecast when the burn rate says the window ends before it resets; reset time once past 50%.
+    const fiveText = five !== null ? limitText("5h", f5 ?? { pct: five }, { showReset: five >= 50 }) : null;
+    const sevenText = seven !== null ? limitText("7d", f7 ?? { pct: seven }, { day: true }) : null;
+    line1.push([fiveText, sevenText].filter(Boolean).join(" · "));
+  }
   line1.push(`${subscription ? `${S.dim}≈ ${S.reset}` : ""}today ${usd(t.cost)} · 7d ${usd(summary.windows.d7.cost)} · 30d ${usd(summary.windows.d30.cost)}`);
   console.log(line1.filter(Boolean).join(sep));
 
@@ -1228,6 +1382,16 @@ function report(summary, top) {
     ),
   );
   out.push("");
+  const L = summary.limits;
+  if (L?.five || L?.seven) {
+    const rate = (f, per) => (f?.slope > 0 ? ` (+${(per === "day" ? f.slope * 24 : f.slope).toFixed(1)}%/${per})` : "");
+    const parts = [];
+    if (L.five) parts.push(`5h ${Math.round(L.five.pct)}%${rate(L.five, "h")}${L.five.eta ? ` → ~${clock(L.five.eta)}` : ""}${L.five.reset ? `, resets ${clock(L.five.reset)}` : ""}`);
+    if (L.seven) parts.push(`7d ${Math.round(L.seven.pct)}%${rate(L.seven, "day")}${L.seven.eta ? ` → ~${dayClock(L.seven.eta)}` : ""}${L.seven.reset ? `, resets ${dayClock(L.seven.reset)}` : ""}`);
+    const age = Date.now() - (L.five?.sampledAt ?? L.seven?.sampledAt ?? 0);
+    out.push(`${C.bold}Current window (subscription)${C.reset}  ${parts.join(" · ")}${age > 30 * 60_000 ? `  ${C.dim}(as of ${localTime(L.five?.sampledAt ?? L.seven?.sampledAt)})${C.reset}` : ""}`);
+    out.push("");
+  }
   out.push(`${C.bold}Tokens (30d)${C.reset}  input ${compact(W.d30.tokens.input)} · output ${compact(W.d30.tokens.output)} · cache read ${compact(W.d30.tokens.cacheRead)} · cache write ${compact(W.d30.tokens.cacheWrite)}`);
   const cx = W.d30.context;
   if (cx?.requests) {
@@ -1419,6 +1583,7 @@ async function main() {
         process.exitCode = 1;
         return;
       }
+      summary.limits = limitsNow();
       if (flags.has("--json")) return console.log(JSON.stringify(summary, null, 2));
       return console.log(report(summary, Number(opt("--top", 10)) || 10));
     }
