@@ -64,6 +64,12 @@ skill costs almost no tokens.
   to a subagent") fixes the habit for good.
 - **Projects table → top leak**: the waste kind that dominates each
   project, so the advice below can be given per project.
+- **Context per request**: the average prompt size every request re-reads
+  (input + cache read + cache write), its distribution, and how many
+  compactions happened. For subscription users this is *the* number: the
+  5h window drains in proportion to it. The status line shows the current
+  session's average as `avg 185K/req`. Zero compactions is normal on 1M
+  context models; a session with several compactions is one to split.
 
 ## Actionable advice to pair with findings
 

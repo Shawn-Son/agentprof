@@ -435,8 +435,14 @@ function emptyBucket() {
     reads: {}, // path -> {count, whole, tokens, cost}   cost = what carrying it afterwards cost
     readCalls: 0,
     readWhole: 0,
+    // Context pressure: prompt size (input + cache read + cache write) per request.
+    ctx: { sum: 0, max: 0, n: 0, bins: [0, 0, 0, 0] }, // bins: <50K, 50–200K, 200–400K, >400K
+    compactions: 0,
   };
 }
+
+const CTX_BINS = [50_000, 200_000, 400_000]; // upper bounds of bins 0..2; bin 3 is everything above
+const ctxBin = (c) => CTX_BINS.findIndex((b) => c < b) === -1 ? CTX_BINS.length : CTX_BINS.findIndex((b) => c < b);
 
 function addBucket(into, from) {
   into.cost += from.cost;
@@ -455,6 +461,13 @@ function addBucket(into, from) {
   for (const [path, e] of Object.entries(from.reads ?? {})) tallyRead(into.reads, path, e);
   into.readCalls += from.readCalls ?? 0;
   into.readWhole += from.readWhole ?? 0;
+  if (from.ctx) {
+    into.ctx.sum += from.ctx.sum;
+    into.ctx.n += from.ctx.n;
+    into.ctx.max = Math.max(into.ctx.max, from.ctx.max);
+    for (let i = 0; i < into.ctx.bins.length; i++) into.ctx.bins[i] += from.ctx.bins[i] ?? 0;
+  }
+  into.compactions += from.compactions ?? 0;
   return into;
 }
 
@@ -514,14 +527,23 @@ function analyzeChain(chain, cfg) {
   });
   const hasUsage = (s) => s.usage.input + s.usage.output + s.usage.cacheRead + s.usage.cacheWrite > 0;
 
-  // ---- usage ----
+  // ---- usage + context pressure ----
   for (const s of steps) {
     const u = unit[s.index];
     const b = dayBucket(s);
     b.requests += 1;
     for (const k of Object.keys(b.tokens)) b.tokens[k] += s.usage[k];
     if (u) b.cost += s.usage.input * u.input + s.usage.output * u.output + s.usage.cacheRead * u.read + s.usage.cacheWrite * u.write;
+    const c = s.usage.input + s.usage.cacheRead + s.usage.cacheWrite; // the prompt this request re-read
+    if (c > 0) {
+      b.ctx.sum += c;
+      b.ctx.n += 1;
+      b.ctx.max = Math.max(b.ctx.max, c);
+      b.ctx.bins[ctxBin(c)] += 1;
+    }
   }
+  // A compaction marker before step k is booked on the day of step k (or the last step).
+  if (steps.length) for (const k of chain.compactionsBeforeStep) dayBucket(steps[Math.min(k, steps.length - 1)]).compactions += 1;
 
   const addWaste = (kind, step, tokens, cost) => {
     const b = dayBucket(step);
@@ -885,6 +907,19 @@ function loadRecords() {
   return out;
 }
 
+function summarizeCtx(b) {
+  const n = b.ctx.n;
+  const share = (i) => (n > 0 ? b.ctx.bins[i] / n : 0);
+  return {
+    requests: n,
+    avg: n > 0 ? Math.round(b.ctx.sum / n) : 0,
+    max: b.ctx.max,
+    bins: b.ctx.bins,
+    over200kShare: share(2) + share(3),
+    over400kShare: share(3),
+  };
+}
+
 function summarizeBucket(b) {
   const confirmedCost = wasteCost(b, CONFIRMED_KINDS);
   const estimatedCost = wasteCost(b, ESTIMATED_KINDS);
@@ -961,6 +996,8 @@ function buildSummary(cfg) {
       ),
       readStats: { calls: total.readCalls, whole: total.readWhole, wholeShare: total.readCalls > 0 ? total.readWhole / total.readCalls : 0 },
       topWholeReads: topN(wholeReads, "cost", 10),
+      context: summarizeCtx(total),
+      compactions: total.compactions,
       topSessions: topN(
         [...sessions.values()].map((s) => ({ sessionId: s.sessionId, project: s.project, models: [...s.models], endTime: s.endTime, cost: s.bucket.cost, wasteCost: wasteCost(s.bucket) })),
         "cost",
@@ -986,6 +1023,8 @@ function buildSummary(cfg) {
       staleShare: wc > 0 ? b.waste.W3.cost / wc : 0,
       unusedMcpTokens: r.unusedMcp.reduce((n, e) => n + e.tokens, 0),
       requests: r.requests,
+      avgContext: b.ctx.n > 0 ? Math.round(b.ctx.sum / b.ctx.n) : 0,
+      compactions: b.compactions,
     };
   }
   out.unknownModels = [...unknown];
@@ -1100,7 +1139,11 @@ async function statusLine() {
   }
 
   const t = summary.windows.today;
-  const line1 = [`${S.bold}◆ ${model}${S.reset}`, ctx];
+  const sess = input.session_id ? summary.sessions?.[input.session_id] : undefined;
+  // Average prompt size per request: this session if known, else today. It is what drains a 5h window.
+  const avgCtx = sess?.avgContext || t.context?.avg || 0;
+  const ctxParts = [ctx, avgCtx ? `avg ${compact(avgCtx)}/req` : null, sess?.compactions ? `${sess.compactions} compaction${sess.compactions > 1 ? "s" : ""}` : null].filter(Boolean);
+  const line1 = [`${S.bold}◆ ${model}${S.reset}`, ctxParts.length ? ctxParts.join(" · ") : null];
   if (subscription) line1.push([five !== null ? `5h ${Math.round(five)}%` : null, seven !== null ? `7d ${Math.round(seven)}%` : null].filter(Boolean).join(" · "));
   line1.push(`${subscription ? `${S.dim}≈ ${S.reset}` : ""}today ${usd(t.cost)} · 7d ${usd(summary.windows.d7.cost)} · 30d ${usd(summary.windows.d30.cost)}`);
   console.log(line1.filter(Boolean).join(sep));
@@ -1116,7 +1159,6 @@ async function statusLine() {
   if (subscription && five !== null) head += ` ≈ 5h ${pct((ratio * five) / 100)}`;
   // Hints are about THIS session (that is where /clear or an MCP change acts).
   const hints = [];
-  const sess = input.session_id ? summary.sessions?.[input.session_id] : undefined;
   if (sess && sess.requests >= cfg.stale_turns && sess.staleShare >= cfg.stale_hint_ratio) hints.push("/clear recommended");
   if (sess && sess.unusedMcpTokens >= cfg.mcp_hint_tokens) hints.push("prune unused MCP");
   if (summary.unknownModels.length) hints.push(`unpriced model: ${summary.unknownModels.map(shortModel).join(",")}`);
@@ -1154,6 +1196,13 @@ function report(summary, top) {
   );
   out.push("");
   out.push(`${C.bold}Tokens (30d)${C.reset}  input ${compact(W.d30.tokens.input)} · output ${compact(W.d30.tokens.output)} · cache read ${compact(W.d30.tokens.cacheRead)} · cache write ${compact(W.d30.tokens.cacheWrite)}`);
+  const cx = W.d30.context;
+  if (cx?.requests) {
+    const binLabels = ["<50K", "50–200K", "200–400K", ">400K"];
+    const dist = cx.bins.map((n, i) => `${binLabels[i]} ${pct(n / cx.requests)}`).join(" · ");
+    out.push(`${C.bold}Context per request (30d)${C.reset}  avg ${compact(cx.avg)} · max ${compact(cx.max)} · ${dist} · compactions ${W.d30.compactions}`);
+    out.push(`${C.dim}Every request re-reads its whole context (as cache reads); the average is what drains a subscription's 5h window. today avg ${compact(W.today.context?.avg ?? 0)} · 7d avg ${compact(W.d7.context?.avg ?? 0)}.${C.reset}`);
+  }
   out.push("");
   out.push(`${C.bold}Waste by kind${C.reset}`);
   out.push(

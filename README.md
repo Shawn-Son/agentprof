@@ -5,7 +5,7 @@
 Cost trackers tell you *how much* you spent. `agentprof` tells you *where it leaked*: context that went stale and got re-sent on every request, files read twice, tool output nobody needed, MCP tool definitions you never called, cache misses. Every number is priced in dollars, split into **confirmed** and **estimated**, and rolled up per day.
 
 ```
-◆ Opus 5 │ ctx 41% │ 5h 34% · 7d 12% │ ≈ today $2.14 · 7d $18.3 · 30d $71.0
+◆ Opus 5 │ ctx 41% · avg 185K/req │ 5h 34% · 7d 12% │ ≈ today $2.14 · 7d $18.3 · 30d $71.0
 ◇ waste $0.81 (38%: confirmed 24% + est 14%) ≈ 5h 11% │ stale 22% · tool-out 9% · MCP 7% │ /clear recommended
 ```
 
@@ -55,6 +55,7 @@ The harness can tell you how much you spent. It cannot tell you *which of your o
 
 - **Files you read whole** — the share of `Read` calls with no `offset`/`limit`, and the files you read whole most often with the cost of carrying each one in every later request. A whole read is often the right call (editing needs the exact text); the lever is *timing*: read right before you need it, and `/clear` or hand exploration to a subagent once it has served its purpose.
 - **Top leak per project** — the waste kind that dominates each project, so the fix can be project-specific (a `CLAUDE.md` rule, an MCP server to disable there).
+- **Context per request** — the average prompt size each request re-reads, its distribution (<50K / 50–200K / 200–400K / >400K), the peak, and the number of compactions. On a subscription this is the number that decides when you hit the 5h limit: every request re-reads its whole context as cache reads. The status line shows the current session's average (`avg 185K/req`). Zero compactions is normal on 1M-context models.
 
 Each context token belongs to exactly **one** kind (precedence: retry > duplicate > tool output > useful; stale applies to the useful part only), so the kinds never overlap and their sum cannot exceed what you actually paid. Costs are booked on the day of the request that paid them. Waste ratio is **cost-based**: `waste $ / total $`. Confirmed and estimated are always shown separately. Thresholds live in `~/.claude/agentprof/config.json` (`stale_turns`, `tool_output_threshold`, `window_days`, `refresh_seconds`).
 
