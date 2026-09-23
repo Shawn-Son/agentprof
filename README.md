@@ -4,12 +4,16 @@
 
 Cost trackers tell you *how much* you spent. `agentprof` tells you *where it leaked*: context that went stale and got re-sent on every request, files read twice, tool output nobody needed, MCP tool definitions you never called, cache misses. Every number is priced in dollars, split into **confirmed** and **estimated**, and rolled up per day.
 
+A real status line, from the author's machine on a Claude Max subscription (2026-09-23):
+
 ```
-◆ Opus 5 │ ctx 41% · avg 185K/req │ 5h 62% → ~3:40pm · 7d 12% │ ≈ today $2.14 · 7d $18.3 · 30d $71.0
-◇ waste $0.81 (38%: confirmed 24% + est 14%) ≈ 5h 11% │ stale 22% · tool-out 9% · MCP 7% │ /clear recommended
+◆ Fable 5.1 │ ctx 4% · avg 37.0K/req │ 5h 76% · resets 12:10pm · 7d 16% │ ≈ today $86.0 · 7d $357 · 30d $1280
+◇ waste $14.6 (17%: confirmed 4% + est 13%) ≈ 5h 13% │ tool-out 7% · stale 6% · MCP 3%
 ```
 
-Subscription users see their 5h/7d window as the main indicator: the percentage, and once a few responses have been sampled, **when the window runs out at the current burn rate** (`→ ~3:40pm`; no arrow means the reset comes first). Dollars are the API-equivalent reference. API-key users see dollars.
+Read it left to right: this session re-reads 37K tokens per request; the 5h window is 76% used and, at the current burn rate, resets at 12:10pm before it runs out (when it would run out first you see `5h 76% → ~11:30am` instead); today's usage is worth $86 at API prices, of which $14.6 (17%) was waste, 13 points of the 5h window. The three biggest leaks today: oversized tool output, stale context, unused MCP tool definitions. When the current session needs a `/clear` or has unused MCP servers, a hint appears at the end of the second line.
+
+Subscription users see the 5h/7d window as the main indicator; dollars are the API-equivalent reference. API-key users see dollars.
 
 ## Install
 
